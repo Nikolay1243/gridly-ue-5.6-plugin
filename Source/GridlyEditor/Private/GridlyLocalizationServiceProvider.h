@@ -137,8 +137,16 @@ public:
 	// Source changes download tracking
 	TWeakObjectPtr<ULocalizationTarget> CurrentSourceDownloadTarget;
 	FString CurrentSourceDownloadCulture;
+	TArray<FString> SourceChangesViewIds;
+	int32 CurrentSourceViewIdIndex;
+	int32 CurrentSourceOffset;
+	int32 SourceChangesLimit;
+	int32 SourceChangesTotalCount;
+	TSharedPtr<IHttpRequest, ESPMode::ThreadSafe> CurrentSourceChangesHttpRequest;
+	TMap<FString, TArray<FGridlySourceRecord>> AccumulatedSourceRecords; // Accumulate records across paginated requests
 public:
 	void DownloadSourceChangesFromGridlyInternal(TWeakObjectPtr<ULocalizationTarget> LocalizationTarget, const FString& NativeCulture);
+	void RequestSourceChangesPage(const int32 ViewIdIndex, const int32 Offset);
 	void ProcessSourceChangesForNamespaces(const TMap<FString, TArray<FGridlySourceRecord>>& NamespaceRecords);
 	bool ImportCSVToStringTable(ULocalizationTarget* LocalizationTarget, const FString& Namespace, const FString& CSVFilePath);
 	void ParseCSVLine(const FString& Line, TArray<FString>& OutFields);

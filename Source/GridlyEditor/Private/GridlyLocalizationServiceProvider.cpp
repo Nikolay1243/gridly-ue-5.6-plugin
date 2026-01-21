@@ -55,6 +55,8 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Editor.h"
 
+#include "GenericPlatform/GenericPlatformHttp.h"
+
 
 #if LOCALIZATION_SERVICES_WITH_SLATE
 #include "DetailCategoryBuilder.h"
@@ -1213,7 +1215,7 @@ void FGridlyLocalizationServiceProvider::DownloadSourceChangesFromGridlyInternal
 		return;
 	}
 
-	// Get the first view ID for import
+	// Get all view IDs for import
 	if (GameSettings->ImportFromViewIds.Num() == 0 || GameSettings->ImportFromViewIds[0].IsEmpty())
 	{
 		UE_LOG(LogGridlyLocalizationServiceProvider, Error, TEXT("❌ No import view ID configured"));
@@ -1221,25 +1223,74 @@ void FGridlyLocalizationServiceProvider::DownloadSourceChangesFromGridlyInternal
 		return;
 	}
 
-	const FString ViewId = GameSettings->ImportFromViewIds[0];
-	const FString Url = FString::Printf(TEXT("https://api.gridly.com/v1/views/%s/records"), *ViewId);
-
-	TSharedRef<IHttpRequest, ESPMode::ThreadSafe> HttpRequest = FHttpModule::Get().CreateRequest();
-	HttpRequest->SetVerb(TEXT("GET"));
-	HttpRequest->SetHeader(TEXT("Accept"), TEXT("application/json"));
-	HttpRequest->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
-	HttpRequest->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("ApiKey %s"), *ApiKey));
-	HttpRequest->SetURL(Url);
-
 	// Store the localization target and culture for the callback
 	CurrentSourceDownloadTarget = LocalizationTarget;
 	CurrentSourceDownloadCulture = NativeCulture;
 
-	HttpRequest->OnProcessRequestComplete().BindRaw(this, &FGridlyLocalizationServiceProvider::OnDownloadSourceChangesFromGridly);
-	HttpRequest->ProcessRequest();
+	// Initialize pagination variables
+	SourceChangesViewIds.Reset();
+	SourceChangesViewIds.Append(GameSettings->ImportFromViewIds);
+	CurrentSourceViewIdIndex = 0;
+	CurrentSourceOffset = 0;
+	SourceChangesLimit = GameSettings->ImportMaxRecordsPerRequest;
+	SourceChangesTotalCount = 0;
+	AccumulatedSourceRecords.Empty();
 
-	UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("🔄 Downloading source changes from Gridly for target: %s, culture: %s"), 
-		*LocalizationTarget->Settings.Name, *NativeCulture);
+	UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("🔄 Downloading source changes from Gridly for target: %s, culture: %s, views: %d"), 
+		*LocalizationTarget->Settings.Name, *NativeCulture, SourceChangesViewIds.Num());
+
+	// Start pagination
+	RequestSourceChangesPage(0, 0);
+}
+
+void FGridlyLocalizationServiceProvider::RequestSourceChangesPage(const int32 ViewIdIndex, const int32 Offset)
+{
+	CurrentSourceViewIdIndex = ViewIdIndex;
+	CurrentSourceOffset = Offset;
+
+	if (SourceChangesViewIds.Num() == 0)
+	{
+		UE_LOG(LogGridlyLocalizationServiceProvider, Error, TEXT("❌ No view IDs available for source changes download"));
+		FMessageDialog::Open(EAppMsgType::Ok, FText::FromString(TEXT("❌ No view IDs available for source changes download.")));
+		return;
+	}
+
+	if (ViewIdIndex < SourceChangesViewIds.Num())
+	{
+		const FString& ViewId = SourceChangesViewIds[ViewIdIndex];
+		const UGridlyGameSettings* GameSettings = GetMutableDefault<UGridlyGameSettings>();
+		const FString ApiKey = GameSettings->ImportApiKey;
+
+		// Build URL with pagination
+		const FString PaginationSettings = FGenericPlatformHttp::UrlEncode(FString::Printf(TEXT("{\"offset\":%d,\"limit\":%d}"),
+			Offset,
+			SourceChangesLimit));
+
+		FStringFormatNamedArguments Args;
+		Args.Add(TEXT("ViewId"), *ViewId);
+		Args.Add(TEXT("PaginationSettings"), *PaginationSettings);
+		const FString Url = FString::Format(TEXT("https://api.gridly.com/v1/views/{ViewId}/records?page={PaginationSettings}"),
+			Args);
+
+		CurrentSourceChangesHttpRequest = FHttpModule::Get().CreateRequest();
+		CurrentSourceChangesHttpRequest->SetVerb(TEXT("GET"));
+		CurrentSourceChangesHttpRequest->SetHeader(TEXT("Accept"), TEXT("application/json"));
+		CurrentSourceChangesHttpRequest->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+		CurrentSourceChangesHttpRequest->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("ApiKey %s"), *ApiKey));
+		CurrentSourceChangesHttpRequest->SetURL(Url);
+
+		CurrentSourceChangesHttpRequest->OnProcessRequestComplete().BindRaw(this, &FGridlyLocalizationServiceProvider::OnDownloadSourceChangesFromGridly);
+		CurrentSourceChangesHttpRequest->ProcessRequest();
+
+		UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("🔄 Requesting source changes - view ID: %s (index %d), offset: %d, limit: %d"), 
+			*ViewId, ViewIdIndex, Offset, SourceChangesLimit);
+	}
+	else
+	{
+		// All view IDs have been processed, finalize by processing collected records
+		UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("✅ All view IDs processed for source changes download. Processing %d namespaces"), AccumulatedSourceRecords.Num());
+		ProcessSourceChangesForNamespaces(AccumulatedSourceRecords);
+	}
 }
 
 void FGridlyLocalizationServiceProvider::OnDownloadSourceChangesFromGridly(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bSuccess)
@@ -1257,15 +1308,32 @@ void FGridlyLocalizationServiceProvider::OnDownloadSourceChangesFromGridly(FHttp
 	TArray<TSharedPtr<FJsonValue>> RecordsArray;
 	TSharedRef<TJsonReader<TCHAR>> JsonReader = TJsonReaderFactory<TCHAR>::Create(ResponseContent);
 	
-	if (!FJsonSerializer::Deserialize(JsonReader, RecordsArray) || RecordsArray.Num() == 0)
+	if (!FJsonSerializer::Deserialize(JsonReader, RecordsArray))
 	{
 		UE_LOG(LogGridlyLocalizationServiceProvider, Error, TEXT("❌ Failed to parse JSON response from Gridly"));
 		FMessageDialog::Open(EAppMsgType::Ok, FText::FromString(TEXT("❌ Failed to parse response from Gridly.")));
 		return;
 	}
 
+	// If response is empty, check if we should move to next view or finish
+	if (RecordsArray.Num() == 0)
+	{
+		UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("⚠️ Empty response for view index %d, offset %d"), CurrentSourceViewIdIndex, CurrentSourceOffset);
+		
+		// If this is the first request for a view, move to next view; otherwise we're done with this view
+		if (CurrentSourceOffset == 0)
+		{
+			RequestSourceChangesPage(CurrentSourceViewIdIndex + 1, 0);
+		}
+		else
+		{
+			// Move to next view
+			RequestSourceChangesPage(CurrentSourceViewIdIndex + 1, 0);
+		}
+		return;
+	}
+
 	// Group records by namespace (path column)
-	TMap<FString, TArray<FGridlySourceRecord>> NamespaceRecords;
 	const UGridlyGameSettings* GameSettings = GetMutableDefault<UGridlyGameSettings>();
 
 	for (const TSharedPtr<FJsonValue>& RecordValue : RecordsArray)
@@ -1349,14 +1417,31 @@ void FGridlyLocalizationServiceProvider::OnDownloadSourceChangesFromGridly(FHttp
 			
 			if (!Namespace.IsEmpty())
 			{
-				NamespaceRecords.FindOrAdd(Namespace).Add(SourceRecord);
+				AccumulatedSourceRecords.FindOrAdd(Namespace).Add(SourceRecord);
 			}
 		}
 	}
 
-	// Generate CSV files for each namespace and update string tables
-	ProcessSourceChangesForNamespaces(NamespaceRecords);
+	// Check if there are more pages for this view
+	const FString TotalCountHeader = Response->GetHeader("X-Total-Count");
+	const int32 ViewTotalCount = TotalCountHeader.IsEmpty() ? 0 : FCString::Atoi(*TotalCountHeader);
+
+	UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("📊 View index %d: received %d records, total count: %d, current offset: %d"), 
+		CurrentSourceViewIdIndex, RecordsArray.Num(), ViewTotalCount, CurrentSourceOffset);
+
+	// Check if we need to fetch more pages for the current view
+	if ((CurrentSourceOffset + SourceChangesLimit) < ViewTotalCount)
+	{
+		// More pages available for this view
+		RequestSourceChangesPage(CurrentSourceViewIdIndex, CurrentSourceOffset + SourceChangesLimit);
+	}
+	else
+	{
+		// Done with this view, move to the next one
+		RequestSourceChangesPage(CurrentSourceViewIdIndex + 1, 0);
+	}
 }
+
 
 void FGridlyLocalizationServiceProvider::ProcessSourceChangesForNamespaces(const TMap<FString, TArray<FGridlySourceRecord>>& NamespaceRecords)
 {
