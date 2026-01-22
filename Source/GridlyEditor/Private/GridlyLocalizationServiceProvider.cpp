@@ -1801,12 +1801,12 @@ UStringTable* FGridlyLocalizationServiceProvider::FindOrCreateStringTable(const 
 	
 			
 			// Check for exact namespace match in the name or path
-			if (StringTableName == Namespace || 
-				StringTableName.EndsWith(FString::Printf(TEXT("_%s"), *Namespace)) ||
-				StringTablePath.Contains(FString::Printf(TEXT("/%s."), *Namespace)) ||
-				StringTablePath.Contains(FString::Printf(TEXT("/%s/"), *Namespace)) ||
-				StringTablePath.EndsWith(FString::Printf(TEXT("/%s"), *Namespace)) ||
-				StringTablePath.Contains(FString::Printf(TEXT("/%s"), *Namespace)))
+			const FString ExactObjectToken = FString::Printf(TEXT("/%s."), *Namespace);
+			const FString ExactFolderToken = FString::Printf(TEXT("/%s/"), *Namespace);
+
+			if (StringTableName == Namespace ||
+				StringTablePath.Contains(ExactObjectToken) ||
+				StringTablePath.Contains(ExactFolderToken))
 			{
 				UE_LOG(LogGridlyLocalizationServiceProvider, Display, TEXT("📋 Found existing string table: %s for namespace: %s"), *StringTable->GetPathName(), *Namespace);
 				return StringTable;
