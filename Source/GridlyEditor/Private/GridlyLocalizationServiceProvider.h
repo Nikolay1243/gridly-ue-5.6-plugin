@@ -45,6 +45,7 @@ class FGridlyLocalizationServiceProvider final : public ILocalizationServiceProv
 		int32 Created = 0;
 		int32 Unchanged = 0;
 		int32 Imported = 0;
+		bool bStringTableCreated = false;
 	};
 
 	public:
@@ -162,7 +163,7 @@ public:
 
 	
 	// String table helper functions
-	UStringTable* FindOrCreateStringTable(const FString& Namespace);
+	UStringTable* FindOrCreateStringTable(const FString& Namespace, bool& bOutStringTableCreated);
 	
 
 

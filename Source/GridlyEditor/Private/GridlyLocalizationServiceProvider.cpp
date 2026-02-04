@@ -1502,14 +1502,15 @@ void FGridlyLocalizationServiceProvider::ProcessSourceChangesForNamespaces(const
 			const bool bImportSuccess = ImportCSVToStringTable(LocalizationTarget, Namespace, CSVFilePath, &ImportStats);
 			if (bImportSuccess)
 			{
-				if (ImportStats.Updated > 0)
-				{
-					UpdatedNamespaces.Add(Namespace);
-				}
-
-				if (ImportStats.Created > 0)
+				if (ImportStats.bStringTableCreated)
 				{
 					CreatedNamespaces.Add(Namespace);
+					continue;
+				}
+
+				if (ImportStats.Updated > 0 || ImportStats.Created > 0)
+				{
+					UpdatedNamespaces.Add(Namespace);
 				}
 
 				if (ImportStats.Updated == 0 && ImportStats.Created == 0)
@@ -1745,7 +1746,8 @@ bool FGridlyLocalizationServiceProvider::ImportKeyValuePairsToStringTable(ULocal
 	}
 
 	// Find or create string table asset for this namespace
-	UStringTable* StringTable = FindOrCreateStringTable(Namespace);
+	bool bStringTableCreated = false;
+	UStringTable* StringTable = FindOrCreateStringTable(Namespace, bStringTableCreated);
 	if (!StringTable)
 	{
 		if (OutStats)
@@ -1806,6 +1808,7 @@ bool FGridlyLocalizationServiceProvider::ImportKeyValuePairsToStringTable(ULocal
 		OutStats->Created = CreatedCount;
 		OutStats->Unchanged = SkippedCount;
 		OutStats->Imported = ImportedCount;
+		OutStats->bStringTableCreated = bStringTableCreated;
 	}
 
 	if (UpdatedCount == 0 && CreatedCount == 0)
@@ -1832,8 +1835,9 @@ bool FGridlyLocalizationServiceProvider::ImportKeyValuePairsToStringTable(ULocal
 	return true;
 }
 
-UStringTable* FGridlyLocalizationServiceProvider::FindOrCreateStringTable(const FString& Namespace)
+UStringTable* FGridlyLocalizationServiceProvider::FindOrCreateStringTable(const FString& Namespace, bool& bOutStringTableCreated)
 {
+	bOutStringTableCreated = false;
 	// Try to find existing string table
 	FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
 	
@@ -1924,7 +1928,9 @@ UStringTable* FGridlyLocalizationServiceProvider::FindOrCreateStringTable(const 
 		UE_LOG(LogGridlyLocalizationServiceProvider, Error, TEXT("❌ Failed to create string table asset: %s"), *AssetName);
 		return nullptr;
 	}
-	
+
+	bOutStringTableCreated = true;
+
 	// Register the asset with the asset registry
 	FAssetRegistryModule::AssetCreated(StringTable);
 	
