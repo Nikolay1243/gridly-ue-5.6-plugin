@@ -1465,6 +1465,9 @@ void FGridlyLocalizationServiceProvider::ProcessSourceChangesForNamespaces(const
 
 	int32 ProcessedNamespaces = 0;
 	int32 TotalNamespaces = NamespaceRecords.Num();
+	TArray<FString> UpdatedNamespaces;
+	TArray<FString> CreatedNamespaces;
+	TArray<FString> UnchangedNamespaces;
 
 	for (const auto& NamespacePair : NamespaceRecords)
 	{
@@ -1495,7 +1498,26 @@ void FGridlyLocalizationServiceProvider::ProcessSourceChangesForNamespaces(const
 			UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("✅ Generated CSV file for namespace '%s': %s"), *Namespace, *CSVFilePath);
 			
 			// Import the CSV into the string table
-			ImportCSVToStringTable(LocalizationTarget, Namespace, CSVFilePath);
+			FImportKeyValuePairsStats ImportStats;
+			const bool bImportSuccess = ImportCSVToStringTable(LocalizationTarget, Namespace, CSVFilePath, &ImportStats);
+			if (bImportSuccess)
+			{
+				if (ImportStats.bStringTableCreated)
+				{
+					CreatedNamespaces.Add(Namespace);
+					continue;
+				}
+
+				if (ImportStats.Updated > 0 || ImportStats.Created > 0)
+				{
+					UpdatedNamespaces.Add(Namespace);
+				}
+
+				if (ImportStats.Updated == 0 && ImportStats.Created == 0)
+				{
+					UnchangedNamespaces.Add(Namespace);
+				}
+			}
 		}
 		else
 		{
@@ -1504,14 +1526,25 @@ void FGridlyLocalizationServiceProvider::ProcessSourceChangesForNamespaces(const
 	}
 
 	// Show completion message
-	FString Message = FString::Printf(TEXT("✅ Source changes processing completed!\n\n📊 Processed %d namespaces\n📁 CSV files saved to: %s\n\n🎉 String tables updated!\n• Source strings have been imported directly into string table assets\n• String table UI should now show the updated/new entries\n• String tables are marked as modified and need to be saved\n\n📝 Next Steps:\n• Review changes in the string table editor\n• Save the modified string table assets\n• Run 'Gather Text' from the Localization Dashboard to update manifest files\n• Commit changes to version control\n\n⚠️ Note: This feature modifies source strings. Review changes before committing."), 
-		ProcessedNamespaces, *TempDir);
+	const FString UpdatedNamespacesList = UpdatedNamespaces.Num() > 0 ? FString::Join(UpdatedNamespaces, TEXT(", ")) : TEXT("None");
+	const FString CreatedNamespacesList = CreatedNamespaces.Num() > 0 ? FString::Join(CreatedNamespaces, TEXT(", ")) : TEXT("None");
+	const FString UnchangedNamespacesList = UnchangedNamespaces.Num() > 0 ? FString::Join(UnchangedNamespaces, TEXT(", ")) : TEXT("None");
+
+	FString Message = FString::Printf(TEXT("✅ Source changes processing completed!\n\n📊 Processed %d namespaces\n📁 CSV files saved to: %s\n\n📈 Namespace summary\n• Updated namespaces: %d\n• Created namespaces: %d\n• Unchanged namespaces: %d\n• Namespaces updated: %s\n• Namespaces created: %s\n• Namespaces unchanged: %s\n\n🎉 String tables updated!\n• Source strings have been imported directly into string table assets\n• String table UI should now show the updated/new entries\n• String tables are marked as modified and need to be saved\n\n📝 Next Steps:\n• Review changes in the string table editor\n• Save the modified string table assets\n• Run 'Gather Text' from the Localization Dashboard to update manifest files\n• Commit changes to version control\n\n⚠️ Note: This feature modifies source strings. Review changes before committing."),
+		ProcessedNamespaces,
+		*TempDir,
+		UpdatedNamespaces.Num(),
+		CreatedNamespaces.Num(),
+		UnchangedNamespaces.Num(),
+		*UpdatedNamespacesList,
+		*CreatedNamespacesList,
+		*UnchangedNamespacesList);
 	
 	UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("%s"), *Message);
 	FMessageDialog::Open(EAppMsgType::Ok, FText::FromString(Message));
 }
 
-bool FGridlyLocalizationServiceProvider::ImportCSVToStringTable(ULocalizationTarget* LocalizationTarget, const FString& Namespace, const FString& CSVFilePath)
+bool FGridlyLocalizationServiceProvider::ImportCSVToStringTable(ULocalizationTarget* LocalizationTarget, const FString& Namespace, const FString& CSVFilePath, FImportKeyValuePairsStats* OutStats)
 {
 	UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("📄 CSV file ready for import: %s"), *CSVFilePath);
 	UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("🏷️ Namespace: %s, Target: %s"), *Namespace, *LocalizationTarget->Settings.Name);
@@ -1616,7 +1649,7 @@ bool FGridlyLocalizationServiceProvider::ImportCSVToStringTable(ULocalizationTar
 	ManifestPath = FPaths::ConvertRelativePathToFull(ManifestPath);
 
 	// Import into string table using the passed localization target
-	bool bSuccess = ImportKeyValuePairsToStringTable(LocalizationTarget, Namespace, KeyValuePairs);
+	bool bSuccess = ImportKeyValuePairsToStringTable(LocalizationTarget, Namespace, KeyValuePairs, OutStats);
 	
 	if (bSuccess)
 	{
@@ -1688,10 +1721,14 @@ void FGridlyLocalizationServiceProvider::ParseCSVLine(const FString& Line, TArra
 	OutFields.Add(CurrentField);
 }
 
-bool FGridlyLocalizationServiceProvider::ImportKeyValuePairsToStringTable(ULocalizationTarget* LocalizationTarget, const FString& Namespace, const TMap<FString, FString>& KeyValuePairs)
+bool FGridlyLocalizationServiceProvider::ImportKeyValuePairsToStringTable(ULocalizationTarget* LocalizationTarget, const FString& Namespace, const TMap<FString, FString>& KeyValuePairs, FImportKeyValuePairsStats* OutStats)
 {
 	if (KeyValuePairs.Num() == 0)
 	{
+		if (OutStats)
+		{
+			*OutStats = FImportKeyValuePairsStats{};
+		}
 		UE_LOG(LogGridlyLocalizationServiceProvider, Warning, TEXT("⚠️ No key-value pairs to import for namespace: %s"), *Namespace);
 		return true;
 	}
@@ -1700,14 +1737,23 @@ bool FGridlyLocalizationServiceProvider::ImportKeyValuePairsToStringTable(ULocal
 
 	if (!LocalizationTarget)
 	{
+		if (OutStats)
+		{
+			*OutStats = FImportKeyValuePairsStats{};
+		}
 		UE_LOG(LogGridlyLocalizationServiceProvider, Error, TEXT("❌ Invalid localization target"));
 		return false;
 	}
 
 	// Find or create string table asset for this namespace
-	UStringTable* StringTable = FindOrCreateStringTable(Namespace);
+	bool bStringTableCreated = false;
+	UStringTable* StringTable = FindOrCreateStringTable(Namespace, bStringTableCreated);
 	if (!StringTable)
 	{
+		if (OutStats)
+		{
+			*OutStats = FImportKeyValuePairsStats{};
+		}
 		UE_LOG(LogGridlyLocalizationServiceProvider, Error, TEXT("❌ Failed to find or create string table for namespace: %s"), *Namespace);
 		return false;
 	}
@@ -1718,6 +1764,7 @@ bool FGridlyLocalizationServiceProvider::ImportKeyValuePairsToStringTable(ULocal
 	int32 ImportedCount = 0;
 	int32 UpdatedCount = 0;
 	int32 CreatedCount = 0;
+	int32 SkippedCount = 0;
 
 	for (const auto& KeyValuePair : KeyValuePairs)
 	{
@@ -1733,6 +1780,12 @@ bool FGridlyLocalizationServiceProvider::ImportKeyValuePairsToStringTable(ULocal
 		
 		if (bExists)
 		{
+			if (ExistingValue == Value)
+			{
+				SkippedCount++;
+				continue;
+			}
+
 			// Update existing entry
 			MutableStringTable.SetSourceString(Key, Value);
 			UpdatedCount++;
@@ -1745,8 +1798,23 @@ bool FGridlyLocalizationServiceProvider::ImportKeyValuePairsToStringTable(ULocal
 			CreatedCount++;
 			UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("🆕 Created new entry: %s = %s"), *Key, *Value);
 		}
-		
+
 		ImportedCount++;
+	}
+
+	if (OutStats)
+	{
+		OutStats->Updated = UpdatedCount;
+		OutStats->Created = CreatedCount;
+		OutStats->Unchanged = SkippedCount;
+		OutStats->Imported = ImportedCount;
+		OutStats->bStringTableCreated = bStringTableCreated;
+	}
+
+	if (UpdatedCount == 0 && CreatedCount == 0)
+	{
+		UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("✅ No changes detected for namespace '%s' (%d entries matched). Skipping modifications."), *Namespace, SkippedCount);
+		return true;
 	}
 
 	// Mark the string table as modified and save it
@@ -1761,14 +1829,15 @@ bool FGridlyLocalizationServiceProvider::ImportKeyValuePairsToStringTable(ULocal
 	// Mark the asset as dirty so user knows it needs saving
 	StringTable->MarkPackageDirty();
 
-	UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("✅ Imported %d/%d entries for namespace '%s' (%d updated, %d created)"), 
-		ImportedCount, KeyValuePairs.Num(), *Namespace, UpdatedCount, CreatedCount);
+	UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("✅ Imported %d/%d entries for namespace '%s' (%d updated, %d created, %d unchanged)"), 
+		ImportedCount, KeyValuePairs.Num(), *Namespace, UpdatedCount, CreatedCount, SkippedCount);
 	
 	return true;
 }
 
-UStringTable* FGridlyLocalizationServiceProvider::FindOrCreateStringTable(const FString& Namespace)
+UStringTable* FGridlyLocalizationServiceProvider::FindOrCreateStringTable(const FString& Namespace, bool& bOutStringTableCreated)
 {
+	bOutStringTableCreated = false;
 	// Try to find existing string table
 	FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
 	
@@ -1859,7 +1928,9 @@ UStringTable* FGridlyLocalizationServiceProvider::FindOrCreateStringTable(const 
 		UE_LOG(LogGridlyLocalizationServiceProvider, Error, TEXT("❌ Failed to create string table asset: %s"), *AssetName);
 		return nullptr;
 	}
-	
+
+	bOutStringTableCreated = true;
+
 	// Register the asset with the asset registry
 	FAssetRegistryModule::AssetCreated(StringTable);
 	
