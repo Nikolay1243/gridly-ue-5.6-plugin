@@ -8,6 +8,167 @@
 #include "GridlyGameSettings.h"
 #include "Internationalization/PolyglotTextData.h"
 #include "Misc/FileHelper.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
+#include "Serialization/JsonWriter.h"
+
+namespace
+{
+bool DoesTokenMatchFlag(const FString& Token, const FString& FlagName)
+{
+	FString NormalizedToken = Token.TrimStartAndEnd().TrimQuotes();
+	NormalizedToken.RemoveFromStart(TEXT("'"));
+	NormalizedToken.RemoveFromEnd(TEXT("'"));
+	return NormalizedToken.Equals(FlagName, ESearchCase::IgnoreCase);
+}
+
+void AddStringTokens(const FString& Value, TArray<FString>& OutTokens)
+{
+	FString TokenizedValue = Value;
+	for (int32 Index = 0; Index < TokenizedValue.Len(); ++Index)
+	{
+		const TCHAR Character = TokenizedValue[Index];
+		if (Character == TEXT(',') || Character == TEXT(';') || Character == TEXT('|') ||
+			Character == TEXT('\n') || Character == TEXT('\r') || Character == TEXT('\t') ||
+			Character == TEXT('[') || Character == TEXT(']') || Character == TEXT('{') ||
+			Character == TEXT('}') || Character == TEXT('(') || Character == TEXT(')') ||
+			Character == TEXT('"') || Character == TEXT('\'') || Character == TEXT(':'))
+		{
+			TokenizedValue[Index] = TEXT(' ');
+		}
+	}
+
+	TokenizedValue.ParseIntoArray(OutTokens, TEXT(" "), true);
+}
+}
+
+const FGridlyContentFilterRule* FGridlyLocalizedTextConverter::GetActiveContentFilterRule(
+	const UGridlyGameSettings* GameSettings)
+{
+	if (!GameSettings || !GameSettings->bEnableContentProfileFiltering || GameSettings->ActiveContentProfile.IsEmpty())
+	{
+		return nullptr;
+	}
+
+	return GameSettings->ProfileRules.Find(GameSettings->ActiveContentProfile);
+}
+
+bool FGridlyLocalizedTextConverter::DoesGridlyCellContainFlag(const FGridlyTableCell& GridlyTableCell,
+	const FString& FlagName)
+{
+	if (FlagName.IsEmpty() || GridlyTableCell.Value.IsEmpty())
+	{
+		return false;
+	}
+
+	if (DoesTokenMatchFlag(GridlyTableCell.Value, FlagName))
+	{
+		return true;
+	}
+
+	TArray<TSharedPtr<FJsonValue>> JsonValues;
+	const TSharedRef<TJsonReader<>> JsonReader = TJsonReaderFactory<>::Create(GridlyTableCell.Value);
+	if (FJsonSerializer::Deserialize(JsonReader, JsonValues))
+	{
+		for (const TSharedPtr<FJsonValue>& JsonValue : JsonValues)
+		{
+			if (!JsonValue.IsValid())
+			{
+				continue;
+			}
+
+			FString JsonToken;
+			if (JsonValue->Type == EJson::String)
+			{
+				JsonToken = JsonValue->AsString();
+			}
+			else
+			{
+				const TSharedRef<TJsonWriter<>> JsonWriter = TJsonWriterFactory<>::Create(&JsonToken);
+				FJsonSerializer::Serialize(JsonValue.ToSharedRef(), TEXT(""), JsonWriter);
+			}
+
+			if (DoesTokenMatchFlag(JsonToken, FlagName))
+			{
+				return true;
+			}
+		}
+	}
+
+	TArray<FString> Tokens;
+	AddStringTokens(GridlyTableCell.Value, Tokens);
+	for (const FString& Token : Tokens)
+	{
+		if (DoesTokenMatchFlag(Token, FlagName))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+bool FGridlyLocalizedTextConverter::ShouldRedactRecord(const FGridlyTableRow& TableRow,
+	const UGridlyGameSettings* GameSettings, const FGridlyContentFilterRule* ContentFilterRule)
+{
+	if (!GameSettings || !ContentFilterRule || ContentFilterRule->FlagName.IsEmpty() || GameSettings->FlagsColumnIdOrName.IsEmpty())
+	{
+		return false;
+	}
+
+	for (const FGridlyTableCell& GridlyTableCell : TableRow.Cells)
+	{
+		const bool bIsConfiguredFlagsColumn = GridlyTableCell.ColumnId.Equals(GameSettings->FlagsColumnIdOrName, ESearchCase::IgnoreCase);
+		if (bIsConfiguredFlagsColumn && DoesGridlyCellContainFlag(GridlyTableCell, ContentFilterRule->FlagName))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+FString FGridlyLocalizedTextConverter::ApplyContentProfileFilteringToText(const FString& Text,
+	const FGridlyTableRow& TableRow, const UGridlyGameSettings* GameSettings, bool bIsSourceText,
+	bool bRespectImportOptIn)
+{
+	if (!GameSettings || (bRespectImportOptIn && !GameSettings->bApplyContentProfileFilteringDuringImport))
+	{
+		return Text;
+	}
+
+	const FGridlyContentFilterRule* ContentFilterRule = GetActiveContentFilterRule(GameSettings);
+	if (!ShouldRedactRecord(TableRow, GameSettings, ContentFilterRule))
+	{
+		return Text;
+	}
+
+	const bool bShouldRedactText = bIsSourceText ? ContentFilterRule->bApplyToSource : ContentFilterRule->bApplyToTranslations;
+	if (!bShouldRedactText)
+	{
+		return Text;
+	}
+
+	if (bRespectImportOptIn && GameSettings->bApplyContentProfileFilteringDuringImport)
+	{
+		UGridlyGameSettings* MutableGameSettings = GetMutableDefault<UGridlyGameSettings>();
+		if (MutableGameSettings && !MutableGameSettings->bEditableAssetsMayContainContentProfileRedactions)
+		{
+			MutableGameSettings->bEditableAssetsMayContainContentProfileRedactions = true;
+			MutableGameSettings->SaveConfig();
+		}
+
+		static bool bHasLoggedImportRedactionWarning = false;
+		if (!bHasLoggedImportRedactionWarning)
+		{
+			bHasLoggedImportRedactionWarning = true;
+			UE_LOG(LogGridly, Warning, TEXT("Content profile filtering is applying during import. Redacted values will be written into editable UE assets. Avoid uploading/exporting these assets to Gridly until a full unredacted import has been performed."));
+		}
+	}
+
+	// Preserve the Gridly record and Unreal StringTable key, replacing only protected text for this content profile.
+	return ContentFilterRule->ReplacementText;
+}
 
 bool FGridlyLocalizedTextConverter::TableRowsToPolyglotTextDatas(const TArray<FGridlyTableRow>& TableRows,
 	TMap<FString, FPolyglotTextData>& OutPolyglotTextDatas)
@@ -62,6 +223,12 @@ bool FGridlyLocalizedTextConverter::TableRowsToPolyglotTextDatas(const TArray<FG
 					Translations.Add(Culture, GridlyTableCell.Value);
 				}
 			}
+		}
+
+		SourceText = ApplyContentProfileFilteringToText(SourceText, TableRows[i], GameSettings, true);
+		for (TPair<FString, FString>& Pair : Translations)
+		{
+			Pair.Value = ApplyContentProfileFilteringToText(Pair.Value, TableRows[i], GameSettings, false);
 		}
 
 		// Namespace / key fixes

@@ -34,9 +34,10 @@ class FGridlyLocalizationServiceProvider final : public ILocalizationServiceProv
 		FString RecordId;
 		FString Path;
 		FString SourceText;
+		bool bWasRedacted;
 
 		FGridlySourceRecord()
-			: RecordId(TEXT("")), Path(TEXT("")), SourceText(TEXT(""))
+			: RecordId(TEXT("")), Path(TEXT("")), SourceText(TEXT("")), bWasRedacted(false)
 		{}
 	};
 	struct FImportKeyValuePairsStats
@@ -55,6 +56,11 @@ class FGridlyLocalizationServiceProvider final : public ILocalizationServiceProv
 		// Manifest handling functions
 		bool ImportKeyValuePairsToStringTable(ULocalizationTarget* LocalizationTarget, const FString& Namespace, const TMap<FString, FString>& KeyValuePairs, FImportKeyValuePairsStats* OutStats = nullptr);
 		bool HasDeleteRequestsPending() const;
+		static bool CanExportToGridly(FText* OutReason = nullptr);
+		static bool CanExecuteExportToGridly();
+		static FText GetExportToGridlyToolTip();
+		static bool WarnIfExportBlocked();
+		static void ClearEditableAssetsRedactionFlagAfterUnredactedImport();
 
 public:
 	/* ILocalizationServiceProvider implementation */

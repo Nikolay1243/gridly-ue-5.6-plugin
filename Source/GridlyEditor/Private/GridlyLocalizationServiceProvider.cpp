@@ -91,14 +91,14 @@ public:
 
 void FGridlyLocalizationTargetEditorCommands::RegisterCommands()
 {
-	UI_COMMAND(ImportAllCulturesForTargetFromGridly, "Import from Gridly",
+	UI_COMMAND(ImportAllCulturesForTargetFromGridly, "Import All from Gridly",
 		"Imports translations for all cultures of this target to Gridly.", EUserInterfaceActionType::Button, FInputChord());
-	UI_COMMAND(ExportNativeCultureForTargetToGridly, "Export to Gridly",
-		"Exports native culture and source text of this target to Gridly.", EUserInterfaceActionType::Button, FInputChord());
+	UI_COMMAND(ExportNativeCultureForTargetToGridly, "Export English to Gridly",
+		"Exports English/source text of this target to Gridly.", EUserInterfaceActionType::Button, FInputChord());
 	UI_COMMAND(ExportTranslationsForTargetToGridly, "Export All to Gridly",
 		"Exports source text and all translations of this target to Gridly.", EUserInterfaceActionType::Button, FInputChord());
-	UI_COMMAND(DownloadSourceChangesFromGridly, "Download Source Changes",
-		"Downloads source changes from Gridly and updates string tables with CSV import.", EUserInterfaceActionType::Button, FInputChord());
+	UI_COMMAND(DownloadSourceChangesFromGridly, "Import English from Gridly",
+		"Imports English/source text from Gridly and updates string tables.", EUserInterfaceActionType::Button, FInputChord());
 }
 
 FGridlyLocalizationServiceProvider::FGridlyLocalizationServiceProvider()
@@ -270,18 +270,20 @@ void FGridlyLocalizationServiceProvider::AddTargetToolbarButtons(FToolBarBuilder
 
 		CommandList->MapAction(FGridlyLocalizationTargetEditorCommands::Get().ExportNativeCultureForTargetToGridly,
 			FExecuteAction::CreateRaw(this, &FGridlyLocalizationServiceProvider::ExportNativeCultureForTargetToGridly,
-				LocalizationTarget, bIsTargetSet));
+				LocalizationTarget, bIsTargetSet),
+			FCanExecuteAction::CreateStatic(&FGridlyLocalizationServiceProvider::CanExecuteExportToGridly));
 		ToolbarBuilder.AddToolBarButton(
 			FGridlyLocalizationTargetEditorCommands::Get().ExportNativeCultureForTargetToGridly, NAME_None,
-			TAttribute<FText>(), TAttribute<FText>(), FSlateIcon(FGridlyStyle::GetStyleSetName(),
+			TAttribute<FText>(), TAttribute<FText>::Create(TAttribute<FText>::FGetter::CreateStatic(&FGridlyLocalizationServiceProvider::GetExportToGridlyToolTip)), FSlateIcon(FGridlyStyle::GetStyleSetName(),
 				"Gridly.ExportAction"));
 
 		CommandList->MapAction(FGridlyLocalizationTargetEditorCommands::Get().ExportTranslationsForTargetToGridly,
 			FExecuteAction::CreateRaw(this, &FGridlyLocalizationServiceProvider::ExportTranslationsForTargetToGridly,
-				LocalizationTarget, bIsTargetSet));
+				LocalizationTarget, bIsTargetSet),
+			FCanExecuteAction::CreateStatic(&FGridlyLocalizationServiceProvider::CanExecuteExportToGridly));
 		ToolbarBuilder.AddToolBarButton(
 			FGridlyLocalizationTargetEditorCommands::Get().ExportTranslationsForTargetToGridly, NAME_None,
-			TAttribute<FText>(), TAttribute<FText>(), FSlateIcon(FGridlyStyle::GetStyleSetName(),
+			TAttribute<FText>(), TAttribute<FText>::Create(TAttribute<FText>::FGetter::CreateStatic(&FGridlyLocalizationServiceProvider::GetExportToGridlyToolTip)), FSlateIcon(FGridlyStyle::GetStyleSetName(),
 				"Gridly.ExportAllAction"));
 
 		CommandList->MapAction(FGridlyLocalizationTargetEditorCommands::Get().DownloadSourceChangesFromGridly,
@@ -294,6 +296,73 @@ void FGridlyLocalizationServiceProvider::AddTargetToolbarButtons(FToolBarBuilder
 	}
 }
 #endif	  // LOCALIZATION_SERVICES_WITH_SLATE
+
+bool FGridlyLocalizationServiceProvider::CanExportToGridly(FText* OutReason)
+{
+	const UGridlyGameSettings* GameSettings = GetMutableDefault<UGridlyGameSettings>();
+	if (GameSettings && (GameSettings->bApplyContentProfileFilteringDuringImport ||
+		GameSettings->bEditableAssetsMayContainContentProfileRedactions))
+	{
+		if (OutReason)
+		{
+			*OutReason = LOCTEXT("GridlyExportRedactedValuesSkipped",
+				"Exports to Gridly. Entries whose English/source text matches a configured content-profile replacement will be skipped so redacted values are not uploaded.");
+		}
+	}
+
+	return true;
+}
+
+bool FGridlyLocalizationServiceProvider::CanExecuteExportToGridly()
+{
+	return CanExportToGridly(nullptr);
+}
+
+FText FGridlyLocalizationServiceProvider::GetExportToGridlyToolTip()
+{
+	FText BlockedReason;
+	if (!CanExportToGridly(&BlockedReason))
+	{
+		return BlockedReason;
+	}
+
+	if (!BlockedReason.IsEmpty())
+	{
+		return BlockedReason;
+	}
+
+	return LOCTEXT("GridlyExportToGridlyToolTip",
+		"Exports source text and translations from this localization target to Gridly.");
+}
+
+bool FGridlyLocalizationServiceProvider::WarnIfExportBlocked()
+{
+	FText Reason;
+	if (CanExportToGridly(&Reason))
+	{
+		return false;
+	}
+
+	if (!IsRunningCommandlet())
+	{
+		FMessageDialog::Open(EAppMsgType::Ok, Reason);
+	}
+	UE_LOG(LogGridlyLocalizationServiceProvider, Warning, TEXT("%s"), *Reason.ToString());
+	return true;
+}
+
+void FGridlyLocalizationServiceProvider::ClearEditableAssetsRedactionFlagAfterUnredactedImport()
+{
+	UGridlyGameSettings* GameSettings = GetMutableDefault<UGridlyGameSettings>();
+	if (GameSettings && !GameSettings->bApplyContentProfileFilteringDuringImport &&
+		GameSettings->bEditableAssetsMayContainContentProfileRedactions)
+	{
+		GameSettings->bEditableAssetsMayContainContentProfileRedactions = false;
+		GameSettings->SaveConfig();
+		UE_LOG(LogGridlyLocalizationServiceProvider, Log,
+			TEXT("Cleared content profile redaction export block after a full unredacted import."));
+	}
+}
 
 void FGridlyLocalizationServiceProvider::ImportAllCulturesForTargetFromGridly(
 	TWeakObjectPtr<ULocalizationTarget> LocalizationTarget, bool bIsTargetSet)
@@ -412,6 +481,7 @@ void FGridlyLocalizationServiceProvider::OnImportCultureForTargetFromGridly(cons
 			Target->UpdateWordCountsFromCSV();
 			Target->UpdateStatusFromConflictReport();
 
+			ClearEditableAssetsRedactionFlagAfterUnredactedImport();
 
 
 		}
@@ -448,6 +518,11 @@ void FGridlyLocalizationServiceProvider::ExportNativeCultureForTargetToGridly(
 	TWeakObjectPtr<ULocalizationTarget> LocalizationTarget, bool bIsTargetSet)
 {
 	check(LocalizationTarget.IsValid());
+
+	if (WarnIfExportBlocked())
+	{
+		return;
+	}
 
 	const EAppReturnType::Type MessageReturn = FMessageDialog::Open(EAppMsgType::YesNo,
 		LOCTEXT("ConfirmText",
@@ -552,6 +627,11 @@ void FGridlyLocalizationServiceProvider::ExportTranslationsForTargetToGridly(TWe
 	UERecords.Empty();
 	GridlyRecords.Empty();
 
+	if (WarnIfExportBlocked())
+	{
+		return;
+	}
+
 	const EAppReturnType::Type MessageReturn = FMessageDialog::Open(EAppMsgType::YesNo,
 		LOCTEXT("ConfirmText",
 			"This will overwrite all your source strings AND translations on Gridly with the data in your UE project. Are you sure you wish to export?"));
@@ -643,6 +723,13 @@ void FGridlyLocalizationServiceProvider::OnExportTranslationsForTargetToGridly(F
 
 void FGridlyLocalizationServiceProvider::ExportForTargetToGridly(ULocalizationTarget* InLocalizationTarget, FHttpRequestCompleteDelegate& ReqDelegate, const FText& SlowTaskText, bool bIncTargetTranslation)
 {
+	FText ExportBlockedReason;
+	if (!CanExportToGridly(&ExportBlockedReason))
+	{
+		UE_LOG(LogGridlyLocalizationServiceProvider, Warning, TEXT("%s"), *ExportBlockedReason.ToString());
+		return;
+	}
+
 	TArray<FPolyglotTextData> PolyglotTextDatas;
 	TSharedPtr<FLocTextHelper> LocTextHelperPtr;
 	UERecords.Empty();
@@ -1345,12 +1432,14 @@ void FGridlyLocalizationServiceProvider::OnDownloadSourceChangesFromGridly(FHttp
 		}
 
 		FGridlySourceRecord SourceRecord;
+		FGridlyTableRow RowForFiltering;
 		
 		// Extract record ID
 		FString RecordId;
 		if ((*RecordObject)->TryGetStringField(FString(TEXT("id")), RecordId))
 		{
 			SourceRecord.RecordId = RecordId;
+			RowForFiltering.Id = RecordId;
 		}
 
 		// Extract path (namespace)
@@ -1358,6 +1447,7 @@ void FGridlyLocalizationServiceProvider::OnDownloadSourceChangesFromGridly(FHttp
 		if ((*RecordObject)->TryGetStringField(FString(TEXT("path")), Path))
 		{
 			SourceRecord.Path = Path;
+			RowForFiltering.Path = Path;
 		}
 
 		// Extract source text from the native culture column
@@ -1372,9 +1462,23 @@ void FGridlyLocalizationServiceProvider::OnDownloadSourceChangesFromGridly(FHttp
 					FString ColumnId;
 					FString Value;
 					
-					if ((*CellObject)->TryGetStringField(FString(TEXT("columnId")), ColumnId) && 
-						(*CellObject)->TryGetStringField(FString(TEXT("value")), Value))
+					if ((*CellObject)->TryGetStringField(FString(TEXT("columnId")), ColumnId))
 					{
+						if (!(*CellObject)->TryGetStringField(FString(TEXT("value")), Value))
+						{
+							const TSharedPtr<FJsonValue> RawValue = (*CellObject)->TryGetField(TEXT("value"));
+							if (RawValue.IsValid() && !RawValue->IsNull())
+							{
+								const TSharedRef<TJsonWriter<>> JsonWriter = TJsonWriterFactory<>::Create(&Value);
+								FJsonSerializer::Serialize(RawValue.ToSharedRef(), TEXT(""), JsonWriter);
+							}
+						}
+
+						FGridlyTableCell GridlyTableCell;
+						GridlyTableCell.ColumnId = ColumnId;
+						GridlyTableCell.Value = Value;
+						RowForFiltering.Cells.Add(GridlyTableCell);
+
 						// Check if this is the source language column
 						if (ColumnId.StartsWith(GameSettings->SourceLanguageColumnIdPrefix))
 						{
@@ -1388,7 +1492,6 @@ void FGridlyLocalizationServiceProvider::OnDownloadSourceChangesFromGridly(FHttp
 								if (Culture == CurrentSourceDownloadCulture)
 								{
 									SourceRecord.SourceText = Value;
-									break;
 								}
 							}
 						}
@@ -1396,6 +1499,11 @@ void FGridlyLocalizationServiceProvider::OnDownloadSourceChangesFromGridly(FHttp
 				}
 			}
 		}
+
+		const FString OriginalSourceText = SourceRecord.SourceText;
+		SourceRecord.SourceText = FGridlyLocalizedTextConverter::ApplyContentProfileFilteringToText(SourceRecord.SourceText,
+			RowForFiltering, GameSettings, true);
+		SourceRecord.bWasRedacted = SourceRecord.SourceText != OriginalSourceText;
 
 		// Only add records that have valid data
 		if (!SourceRecord.RecordId.IsEmpty() && !SourceRecord.SourceText.IsEmpty())
@@ -1468,6 +1576,7 @@ void FGridlyLocalizationServiceProvider::ProcessSourceChangesForNamespaces(const
 	TArray<FString> UpdatedNamespaces;
 	TArray<FString> CreatedNamespaces;
 	TArray<FString> UnchangedNamespaces;
+	int32 RedactedKeysCount = 0;
 
 	for (const auto& NamespacePair : NamespaceRecords)
 	{
@@ -1480,14 +1589,25 @@ void FGridlyLocalizationServiceProvider::ProcessSourceChangesForNamespaces(const
 
 		// Generate CSV content
 		FString CSVContent = TEXT("Key,SourceString\n");
+		TMap<FString, FString> KeyValuePairs;
 		
 		for (const FGridlySourceRecord& Record : Records)
 		{
+			if (Record.bWasRedacted)
+			{
+				++RedactedKeysCount;
+			}
+
 			// Escape quotes in the source text
 			FString EscapedSourceText = Record.SourceText;
 			EscapedSourceText = EscapedSourceText.Replace(TEXT("\""), TEXT("\"\""));
 			
 			CSVContent += FString::Printf(TEXT("\"%s\",\"%s\"\n"), *Record.RecordId, *EscapedSourceText);
+
+			if (!Record.RecordId.IsEmpty() && !Record.SourceText.IsEmpty())
+			{
+				KeyValuePairs.Add(Record.RecordId, Record.SourceText);
+			}
 		}
 
 		// Write CSV file
@@ -1497,9 +1617,10 @@ void FGridlyLocalizationServiceProvider::ProcessSourceChangesForNamespaces(const
 		{
 			UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("✅ Generated CSV file for namespace '%s': %s"), *Namespace, *CSVFilePath);
 			
-			// Import the CSV into the string table
+			// Import the already-redacted source changes directly into the string table.
+			// The CSV is kept as a debug artifact only; reparsing it here can hide whether redaction reached the write path.
 			FImportKeyValuePairsStats ImportStats;
-			const bool bImportSuccess = ImportCSVToStringTable(LocalizationTarget, Namespace, CSVFilePath, &ImportStats);
+			const bool bImportSuccess = ImportKeyValuePairsToStringTable(LocalizationTarget, Namespace, KeyValuePairs, &ImportStats);
 			if (bImportSuccess)
 			{
 				if (ImportStats.bStringTableCreated)
@@ -1539,6 +1660,14 @@ void FGridlyLocalizationServiceProvider::ProcessSourceChangesForNamespaces(const
 		*UpdatedNamespacesList,
 		*CreatedNamespacesList,
 		*UnchangedNamespacesList);
+	// Keep the completion dialog concise; listing every namespace can look like an error in large projects.
+	Message = FString::Printf(TEXT("Source changes processing completed!\n\nProcessed namespaces: %d\nUpdated namespaces: %d\nCreated namespaces: %d\nUnchanged namespaces: %d\nKeys redacted: %d\n\nCSV files saved to: %s\n\nString tables were updated and marked as modified.\nReview and save the modified StringTable assets, then run Gather Text from the Localization Dashboard."),
+		ProcessedNamespaces,
+		UpdatedNamespaces.Num(),
+		CreatedNamespaces.Num(),
+		UnchangedNamespaces.Num(),
+		RedactedKeysCount,
+		*TempDir);
 	
 	UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("%s"), *Message);
 	FMessageDialog::Open(EAppMsgType::Ok, FText::FromString(Message));
@@ -1655,6 +1784,7 @@ bool FGridlyLocalizationServiceProvider::ImportCSVToStringTable(ULocalizationTar
 	{
 		UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("✅ Successfully imported %d entries for namespace '%s'"), 
 		KeyValuePairs.Num(), *Namespace);
+		ClearEditableAssetsRedactionFlagAfterUnredactedImport();
 	}
 	else
 	{
@@ -1814,6 +1944,7 @@ bool FGridlyLocalizationServiceProvider::ImportKeyValuePairsToStringTable(ULocal
 	if (UpdatedCount == 0 && CreatedCount == 0)
 	{
 		UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("✅ No changes detected for namespace '%s' (%d entries matched). Skipping modifications."), *Namespace, SkippedCount);
+		ClearEditableAssetsRedactionFlagAfterUnredactedImport();
 		return true;
 	}
 
@@ -1831,6 +1962,7 @@ bool FGridlyLocalizationServiceProvider::ImportKeyValuePairsToStringTable(ULocal
 
 	UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("✅ Imported %d/%d entries for namespace '%s' (%d updated, %d created, %d unchanged)"), 
 		ImportedCount, KeyValuePairs.Num(), *Namespace, UpdatedCount, CreatedCount, SkippedCount);
+	ClearEditableAssetsRedactionFlagAfterUnredactedImport();
 	
 	return true;
 }

@@ -8,6 +8,7 @@
 #include "GridlyDataTableImporterJSON.h"
 #include "Gridly.h"
 #include "GridlyGameSettings.h"
+#include "GridlyLocalizedTextConverter.h"
 #include "GridlyTableRow.h"
 #include "HttpModule.h"
 #include "JsonObjectConverter.h"
@@ -113,11 +114,25 @@ void UGridlyTask_ImportDataTableFromGridly::RequestPage(const int ViewIdIndex, c
 		{
 			const TSharedPtr<FJsonObject> JsonObject = MakeShareable(new FJsonObject);
 			JsonObject->SetStringField("name", GridlyTableRows[i].Id);
+			const UGridlyGameSettings* GameSettings = GetMutableDefault<UGridlyGameSettings>();
 
 			for (int j = 0; j < GridlyTableRows[i].Cells.Num(); j++)
 			{
+				const FGridlyTableCell& GridlyTableCell = GridlyTableRows[i].Cells[j];
+				FString CellValue = GridlyTableCell.Value;
+				if (GridlyTableCell.ColumnId.StartsWith(GameSettings->SourceLanguageColumnIdPrefix))
+				{
+					CellValue = FGridlyLocalizedTextConverter::ApplyContentProfileFilteringToText(CellValue, GridlyTableRows[i],
+						GameSettings, true);
+				}
+				else if (GridlyTableCell.ColumnId.StartsWith(GameSettings->TargetLanguageColumnIdPrefix))
+				{
+					CellValue = FGridlyLocalizedTextConverter::ApplyContentProfileFilteringToText(CellValue, GridlyTableRows[i],
+						GameSettings, false);
+				}
+
 				JsonObject->SetStringField("_path", GridlyTableRows[i].Path);
-				JsonObject->SetStringField(GridlyTableRows[i].Cells[j].ColumnId, GridlyTableRows[i].Cells[j].Value);
+				JsonObject->SetStringField(GridlyTableCell.ColumnId, CellValue);
 			}
 
 			JsonValues.Add(MakeShareable(new FJsonValueObject(JsonObject)));

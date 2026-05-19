@@ -23,10 +23,38 @@
 #include "UObject/UObjectGlobals.h"
 #include "UObject/Class.h"
 #include <GridlyGameSettings.h>
+#include "GridlyLocalizedTextConverter.h"
+#include "GridlyTableRow.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogGridlyImportExportCommandlet, Log, All);
 
 #define LOCTEXT_NAMESPACE "GridlyImportExportCommandlet"
+
+namespace
+{
+FString GetGridlyJsonCellValueAsString(const TSharedPtr<FJsonObject>& CellObj)
+{
+	FString Value;
+	if (!CellObj.IsValid())
+	{
+		return Value;
+	}
+
+	if (CellObj->TryGetStringField(TEXT("value"), Value))
+	{
+		return Value;
+	}
+
+	const TSharedPtr<FJsonValue> RawValue = CellObj->TryGetField(TEXT("value"));
+	if (RawValue.IsValid() && !RawValue->IsNull())
+	{
+		const TSharedRef<TJsonWriter<>> JsonWriter = TJsonWriterFactory<>::Create(&Value);
+		FJsonSerializer::Serialize(RawValue.ToSharedRef(), TEXT(""), JsonWriter);
+	}
+
+	return Value;
+}
+}
 
 /**
 *	UGridlyImportExportCommandlet
@@ -634,6 +662,8 @@ void UGridlyImportExportCommandlet::OnDownloadSourceChangesFromGridly(FHttpReque
 
 		FGridlySourceRecord SourceRecord;
 		SourceRecord.RecordId = RecordObj->GetStringField(TEXT("id"));
+		FGridlyTableRow RowForFiltering;
+		RowForFiltering.Id = SourceRecord.RecordId;
 		
 		UE_LOG(LogGridlyImportExportCommandlet, Log, TEXT("Processing record ID: %s"), *SourceRecord.RecordId);
 		
@@ -664,11 +694,17 @@ void UGridlyImportExportCommandlet::OnDownloadSourceChangesFromGridly(FHttpReque
 							if (CellObj.IsValid())
 							{
 								FString CellColumnId = CellObj->GetStringField(TEXT("columnId"));
+								FString CellValueString = GetGridlyJsonCellValueAsString(CellObj);
+
+								FGridlyTableCell GridlyTableCell;
+								GridlyTableCell.ColumnId = CellColumnId;
+								GridlyTableCell.Value = CellValueString;
+								RowForFiltering.Cells.Add(GridlyTableCell);
+
 								if (CellColumnId == SourceColumnId)
 								{
-									SourceRecord.SourceText = CellObj->GetStringField(TEXT("value"));
+									SourceRecord.SourceText = CellValueString;
 									UE_LOG(LogGridlyImportExportCommandlet, Log, TEXT("Found source text for record %s: %s"), *SourceRecord.RecordId, *SourceRecord.SourceText);
-									break;
 								}
 							}
 						}
@@ -680,6 +716,23 @@ void UGridlyImportExportCommandlet::OnDownloadSourceChangesFromGridly(FHttpReque
 					const TSharedPtr<FJsonObject> CellsObj = CellsValue->AsObject();
 					if (CellsObj.IsValid())
 					{
+						for (const TPair<FString, TSharedPtr<FJsonValue>>& CellPair : CellsObj->Values)
+						{
+							if (CellPair.Value.IsValid() && !CellPair.Value->IsNull())
+							{
+								const TSharedPtr<FJsonObject> CellObj = CellPair.Value->AsObject();
+								if (CellObj.IsValid())
+								{
+									FString CellValueString = GetGridlyJsonCellValueAsString(CellObj);
+
+									FGridlyTableCell GridlyTableCell;
+									GridlyTableCell.ColumnId = CellPair.Key;
+									GridlyTableCell.Value = CellValueString;
+									RowForFiltering.Cells.Add(GridlyTableCell);
+								}
+							}
+						}
+
 						// Look for the source culture column
 						FString SourceColumnId = FString::Printf(TEXT("src_%s"), *CurrentSourceDownloadCulture);
 						SourceColumnId = SourceColumnId.Replace(TEXT("-"), TEXT(""));
@@ -694,7 +747,9 @@ void UGridlyImportExportCommandlet::OnDownloadSourceChangesFromGridly(FHttpReque
 								const TSharedPtr<FJsonObject> CellObj = CellValue->AsObject();
 								if (CellObj.IsValid())
 								{
-									SourceRecord.SourceText = CellObj->GetStringField(TEXT("value"));
+									FString CellValueString = GetGridlyJsonCellValueAsString(CellObj);
+
+									SourceRecord.SourceText = CellValueString;
 									UE_LOG(LogGridlyImportExportCommandlet, Log, TEXT("Found source text for record %s: %s"), *SourceRecord.RecordId, *SourceRecord.SourceText);
 								}
 							}
@@ -703,6 +758,10 @@ void UGridlyImportExportCommandlet::OnDownloadSourceChangesFromGridly(FHttpReque
 				}
 			}
 		}
+
+		const UGridlyGameSettings* GameSettings = GetMutableDefault<UGridlyGameSettings>();
+		SourceRecord.SourceText = FGridlyLocalizedTextConverter::ApplyContentProfileFilteringToText(SourceRecord.SourceText,
+			RowForFiltering, GameSettings, true);
 
 		// Determine namespace from record ID (assuming format "Namespace,Key")
 		FString Namespace = TEXT("Default");

@@ -8,6 +8,7 @@
 #include "GridlyEditor.h"
 #include "GridlyExporter.h"
 #include "GridlyGameSettings.h"
+#include "GridlyLocalizationServiceProvider.h"
 #include "GridlyStyle.h"
 #include "GridlyTableRow.h"
 #include "GridlyTask_ImportDataTableFromGridly.h"
@@ -173,7 +174,8 @@ void FAssetTypeActions_GridlyDataTable::OpenAssetEditor(const TArray<UObject*>& 
 		CommandList->MapAction(FGridlyDataTableCommands::Get().ImportFromGridly,
 			FExecuteAction::CreateRaw(this, &FAssetTypeActions_GridlyDataTable::ImportFromGridly, GridlyDataTable));
 		CommandList->MapAction(FGridlyDataTableCommands::Get().ExportToGridly,
-			FExecuteAction::CreateRaw(this, &FAssetTypeActions_GridlyDataTable::ExportToGridly, GridlyDataTable));
+			FExecuteAction::CreateRaw(this, &FAssetTypeActions_GridlyDataTable::ExportToGridly, GridlyDataTable),
+			FCanExecuteAction::CreateStatic(&FGridlyLocalizationServiceProvider::CanExecuteExportToGridly));
 
 		Extender->AddToolBarExtension("DataTableCommands", EExtensionHook::Before, CommandList,
 			FToolBarExtensionDelegate::CreateRaw(this, &FAssetTypeActions_GridlyDataTable::AddToolbarButton));
@@ -305,6 +307,7 @@ void FAssetTypeActions_GridlyDataTable::ImportFromGridly(UGridlyDataTable* DataT
 		{
 			SlowTask.Reset();
 			FDataTableEditorUtils::BroadcastPostChange(GridlyDataTable, FDataTableEditorUtils::EDataTableChangeInfo::RowList);
+			FGridlyLocalizationServiceProvider::ClearEditableAssetsRedactionFlagAfterUnredactedImport();
 		});
 
 	Task->OnFailDelegate.BindLambda(
@@ -355,6 +358,11 @@ bool CreateExportRequest(const UGridlyDataTable* GridlyDataTable,
 
 void FAssetTypeActions_GridlyDataTable::ExportToGridly(UGridlyDataTable* DataTable)
 {
+	if (FGridlyLocalizationServiceProvider::WarnIfExportBlocked())
+	{
+		return;
+	}
+
 	const FString ConfirmMessage = FString::Printf(
 		TEXT("This may overwrite some of your data on Gridly (view ID %s). Are you sure you wish to export?"), *DataTable->ViewId);
 	const EAppReturnType::Type MessageReturn = FMessageDialog::Open(EAppMsgType::YesNo,

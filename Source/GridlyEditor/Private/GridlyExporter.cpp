@@ -8,6 +8,29 @@
 #include "Internationalization/PolyglotTextData.h"
 #include "LocTextHelper.h"
 
+namespace
+{
+bool IsContentProfileReplacementText(const FString& Text, const UGridlyGameSettings* GameSettings)
+{
+	if (!GameSettings)
+	{
+		return false;
+	}
+
+	const FString TrimmedText = Text.TrimStartAndEnd();
+	for (const TPair<FString, FGridlyContentFilterRule>& ProfileRulePair : GameSettings->ProfileRules)
+	{
+		const FString TrimmedReplacementText = ProfileRulePair.Value.ReplacementText.TrimStartAndEnd();
+		if (!TrimmedReplacementText.IsEmpty() && TrimmedText.Equals(TrimmedReplacementText, ESearchCase::CaseSensitive))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+}
+
 bool FGridlyExporter::ConvertToJson(const TArray<FPolyglotTextData>& PolyglotTextDatas,
 	bool bIncludeTargetTranslations, const TSharedPtr<FLocTextHelper>& LocTextHelperPtr, FString& OutJsonString)
 {
@@ -27,6 +50,12 @@ bool FGridlyExporter::ConvertToJson(const TArray<FPolyglotTextData>& PolyglotTex
 
 		const FString& Key = PolyglotTextDatas[i].GetKey();
 		const FString& Namespace = PolyglotTextDatas[i].GetNamespace();
+		const FString NativeString = PolyglotTextDatas[i].GetNativeString();
+		if (IsContentProfileReplacementText(NativeString, GameSettings))
+		{
+			// Do not upload redacted editable asset content back to Gridly. Skipping preserves Gridly's canonical value.
+			continue;
+		}
 
 		const FManifestContext* ItemContext = nullptr;
 		if (LocTextHelperPtr.IsValid())
@@ -74,7 +103,6 @@ bool FGridlyExporter::ConvertToJson(const TArray<FPolyglotTextData>& PolyglotTex
 
 		{
 			const FString NativeCulture = PolyglotTextDatas[i].GetNativeCulture();
-			const FString NativeString = PolyglotTextDatas[i].GetNativeString();
 
 			FString GridlyCulture;
 			if (FGridlyCultureConverter::ConvertToGridly(NativeCulture, GridlyCulture))
@@ -195,6 +223,32 @@ bool FGridlyExporter::ConvertToJson(const UGridlyDataTable* GridlyDataTable, FSt
 		{
 			const FName RowName = Keys[i];
 			uint8* RowData = RowMap[RowName];
+			bool bSkipRowBecauseSourceIsRedacted = false;
+
+			for (TFieldIterator<const FProperty> It(GridlyDataTable->GetRowStruct()); It; ++It)
+			{
+				const FProperty* BaseProp = *It;
+				check(BaseProp);
+
+				const EDataTableExportFlags DTExportFlags = EDataTableExportFlags::None;
+				const FString Identifier = DataTableUtils::GetPropertyExportName(BaseProp, DTExportFlags);
+				if (Identifier.StartsWith(GameSettings->SourceLanguageColumnIdPrefix))
+				{
+					const FString PropertyValue = DataTableUtils::GetPropertyValueAsString(BaseProp,
+						static_cast<uint8*>(RowData), DTExportFlags);
+					if (IsContentProfileReplacementText(PropertyValue, GameSettings))
+					{
+						bSkipRowBecauseSourceIsRedacted = true;
+						break;
+					}
+				}
+			}
+
+			if (bSkipRowBecauseSourceIsRedacted)
+			{
+				// Do not upload rows whose source-language value is an imported content-profile placeholder.
+				continue;
+			}
 
 			JsonWriter->WriteObjectStart();
 			{

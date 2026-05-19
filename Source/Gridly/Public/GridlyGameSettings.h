@@ -26,6 +26,29 @@ public:
     EGridlyColumnDataType DataType;
 };
 
+USTRUCT(BlueprintType)
+struct GRIDLY_API FGridlyContentFilterRule
+{
+    GENERATED_BODY()
+
+public:
+    /** Flag value that marks a record for redaction in the active content profile. */
+    UPROPERTY(EditAnywhere, Config, Category = "Content Profile Filtering")
+    FString FlagName;
+
+    /** Text imported instead of protected source or translation content. */
+    UPROPERTY(EditAnywhere, Config, Category = "Content Profile Filtering")
+    FString ReplacementText = TEXT("[REDACTED]");
+
+    /** Redact source/native strings while preserving the StringTable key. */
+    UPROPERTY(EditAnywhere, Config, Category = "Content Profile Filtering")
+    bool bApplyToSource = true;
+
+    /** Redact translated strings while preserving the StringTable key. */
+    UPROPERTY(EditAnywhere, Config, Category = "Content Profile Filtering")
+    bool bApplyToTranslations = true;
+};
+
 UCLASS(BlueprintType, Config = Game, DefaultConfig,
     AutoExpandCategories = ("Gridly|Import Settings", "Gridly|Export Settings", "Gridly|Options"))
     class GRIDLY_API UGridlyGameSettings final : public UObject
@@ -112,6 +135,34 @@ public:
     /** This will remap metadata to specific Gridly columns during the export */
     UPROPERTY(Category = "Gridly|Options", BlueprintReadOnly, EditAnywhere, Config, meta = (EditCondition = "bExportMetadata"))
     TMap<FString, FGridlyColumnInfo> MetadataMapping;
+
+    /** Replaces imported text for flagged Gridly records without removing rows, records, or StringTable keys. */
+    UPROPERTY(Category = "Gridly|Content Profile Filtering", BlueprintReadOnly, EditAnywhere, Config)
+    bool bEnableContentProfileFiltering = false;
+
+    /** 
+     * Opt-in only: applies redaction during editor/import operations.
+     * Leave disabled for canonical StringTable assets so upload-to-Gridly always uses full source content.
+     * Enable only when importing into duplicate/transient/demo assets, or use a future cook/build materialization step.
+     */
+    UPROPERTY(Category = "Gridly|Content Profile Filtering|Advanced", BlueprintReadOnly, EditAnywhere, Config)
+    bool bApplyContentProfileFilteringDuringImport = false;
+
+    /** Set automatically after import-time filtering writes redacted values into editable assets. Run a full unredacted import before exporting to Gridly. */
+    UPROPERTY(Category = "Gridly|Content Profile Filtering|Advanced", BlueprintReadOnly, VisibleAnywhere, Config)
+    bool bEditableAssetsMayContainContentProfileRedactions = false;
+
+    /** Active profile key used to look up ProfileRules. "FullGame" imports normally unless it has an explicit rule. */
+    UPROPERTY(Category = "Gridly|Content Profile Filtering", BlueprintReadOnly, EditAnywhere, Config)
+    FString ActiveContentProfile = TEXT("FullGame");
+
+    /** Gridly flags column ID or display name, for example "Flags" or an internal Gridly column ID. */
+    UPROPERTY(Category = "Gridly|Content Profile Filtering", BlueprintReadOnly, EditAnywhere, Config)
+    FString FlagsColumnIdOrName = TEXT("Flags");
+
+    /** Per-profile flag redaction rules. Add entries such as Demo -> ExcludeFromDemo. */
+    UPROPERTY(Category = "Gridly|Content Profile Filtering", BlueprintReadOnly, EditAnywhere, Config)
+    TMap<FString, FGridlyContentFilterRule> ProfileRules;
 
 public:
     UGridlyGameSettings(const FObjectInitializer& ObjectInitializer);
