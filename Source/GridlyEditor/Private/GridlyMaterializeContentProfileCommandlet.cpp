@@ -14,10 +14,12 @@
 #include "Internationalization/StringTable.h"
 #include "Internationalization/StringTableCore.h"
 #include "JsonObjectConverter.h"
+#include "LocalizationCommandletExecution.h"
 #include "LocalizationConfigurationScript.h"
 #include "LocalizationSettings.h"
 #include "LocalizationTargetTypes.h"
 #include "Modules/ModuleManager.h"
+#include "Misc/ConfigCacheIni.h"
 #include "Misc/FileHelper.h"
 #include "Misc/PackageName.h"
 #include "Misc/Paths.h"
@@ -29,6 +31,11 @@
 #include "UObject/SavePackage.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogGridlyMaterializeContentProfileCommandlet, Log, All);
+
+namespace
+{
+bool RunLocalizationCommandletTasks(const TArray<LocalizationCommandletExecution::FTask>& Tasks);
+}
 
 UGridlyMaterializeContentProfileCommandlet::UGridlyMaterializeContentProfileCommandlet(
 	const FObjectInitializer& ObjectInitializer)
@@ -79,23 +86,34 @@ int32 UGridlyMaterializeContentProfileCommandlet::Main(const FString& Params)
 	}
 
 	TMap<FString, FGridlyTableRow> RowsByNamespaceAndKey;
-	BuildRecordLookup(GridlyRows, RowsByNamespaceAndKey);
+	TMultiMap<FString, FGridlyTableRow> RowsByKey;
+	BuildRecordLookup(GridlyRows, RowsByNamespaceAndKey, RowsByKey);
 
 	FMaterializeStats Stats;
-	if (!MaterializeStringTables(Options, RowsByNamespaceAndKey, Stats))
+	if (!MaterializeStringTables(Options, RowsByNamespaceAndKey, RowsByKey, Stats))
 	{
 		return 1;
 	}
 
-	if (!MaterializeLocalizationArchives(Options, RowsByNamespaceAndKey, Stats))
+	if (Options.bApplyToCanonicalForBuild && !RunGatherTextForLocalizationTargets())
+	{
+		return 1;
+	}
+
+	if (!MaterializeLocalizationArchives(Options, RowsByNamespaceAndKey, RowsByKey, Stats))
+	{
+		return 1;
+	}
+
+	if (Options.bApplyToCanonicalForBuild && !RunCompileTextForLocalizationTargets())
 	{
 		return 1;
 	}
 
 	UE_LOG(LogGridlyMaterializeContentProfileCommandlet, Display,
-		TEXT("Content profile materialization complete. LocalizationProfile='%s', TablesDuplicated=%d, KeysPreserved=%d, SourceValuesRedacted=%d, ArchivesMaterialized=%d, TranslationsRedacted=%d, OriginalAssetsModified=0"),
+		TEXT("Content profile materialization complete. LocalizationProfile='%s', TablesDuplicated=%d, KeysPreserved=%d, SourceValuesRedacted=%d, ArchivesMaterialized=%d, TranslationsRedacted=%d, OriginalAssetsModified=%d"),
 		*Options.LocalizationProfile, Stats.TablesDuplicated, Stats.KeysPreserved, Stats.ValuesRedacted, Stats.ArchivesMaterialized,
-		Stats.TranslationsRedacted);
+		Stats.TranslationsRedacted, Options.bApplyToCanonicalForBuild ? 1 : 0);
 	return 0;
 }
 
@@ -272,7 +290,7 @@ bool UGridlyMaterializeContentProfileCommandlet::FetchGridlyRows(TArray<FGridlyT
 }
 
 void UGridlyMaterializeContentProfileCommandlet::BuildRecordLookup(const TArray<FGridlyTableRow>& Rows,
-	TMap<FString, FGridlyTableRow>& OutRowsByNamespaceAndKey) const
+	TMap<FString, FGridlyTableRow>& OutRowsByNamespaceAndKey, TMultiMap<FString, FGridlyTableRow>& OutRowsByKey) const
 {
 	const UGridlyGameSettings* GameSettings = GetMutableDefault<UGridlyGameSettings>();
 	if (!GameSettings)
@@ -287,6 +305,7 @@ void UGridlyMaterializeContentProfileCommandlet::BuildRecordLookup(const TArray<
 	{
 		FString Namespace = bUsePathAsNamespace ? Row.Path : TEXT("");
 		FString Key = Row.Id;
+		const FString OriginalRowId = Row.Id;
 
 		if (!bUsePathAsNamespace && !bUseCombinedNamespaceKey)
 		{
@@ -314,14 +333,38 @@ void UGridlyMaterializeContentProfileCommandlet::BuildRecordLookup(const TArray<
 		{
 			OutRowsByNamespaceAndKey.Add(MakeRecordLookupKey(Namespace, Key), Row);
 		}
+		if (!Key.IsEmpty())
+		{
+			OutRowsByKey.Add(Key, Row);
+		}
+
+		FString PathNamespace = Row.Path.Replace(TEXT(" "), TEXT(""));
+		if (!PathNamespace.IsEmpty() && !Key.IsEmpty())
+		{
+			OutRowsByNamespaceAndKey.Add(MakeRecordLookupKey(PathNamespace, Key), Row);
+		}
+
+		FString RowIdNamespace;
+		FString RowIdKey;
+		if (OriginalRowId.Split(TEXT(","), &RowIdNamespace, &RowIdKey))
+		{
+			RowIdNamespace = RowIdNamespace.Replace(TEXT(" "), TEXT(""));
+			if (!RowIdNamespace.IsEmpty() && !RowIdKey.IsEmpty())
+			{
+				OutRowsByNamespaceAndKey.Add(MakeRecordLookupKey(RowIdNamespace, RowIdKey), Row);
+				OutRowsByKey.Add(RowIdKey, Row);
+			}
+		}
 	}
 
 	UE_LOG(LogGridlyMaterializeContentProfileCommandlet, Display,
-		TEXT("Built flag lookup for %d namespace/key records."), OutRowsByNamespaceAndKey.Num());
+		TEXT("Built flag lookup for %d namespace/key records and %d key records."),
+		OutRowsByNamespaceAndKey.Num(), OutRowsByKey.Num());
 }
 
 bool UGridlyMaterializeContentProfileCommandlet::MaterializeStringTables(const FMaterializeOptions& Options,
-	const TMap<FString, FGridlyTableRow>& RowsByNamespaceAndKey, FMaterializeStats& OutStats) const
+	const TMap<FString, FGridlyTableRow>& RowsByNamespaceAndKey, const TMultiMap<FString, FGridlyTableRow>& RowsByKey,
+	FMaterializeStats& OutStats) const
 {
 	FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
 
@@ -331,12 +374,32 @@ bool UGridlyMaterializeContentProfileCommandlet::MaterializeStringTables(const F
 	Filter.bRecursivePaths = true;
 
 	TArray<FAssetData> StringTableAssets;
+	AssetRegistryModule.Get().SearchAllAssets(true);
 	AssetRegistryModule.Get().GetAssets(Filter, StringTableAssets);
 	if (StringTableAssets.Num() == 0)
 	{
-		UE_LOG(LogGridlyMaterializeContentProfileCommandlet, Warning,
-			TEXT("No StringTable assets found under SourceRoot '%s'."), *Options.SourceRoot);
-		return false;
+		// SourceRoot is usually a folder, but accepting an exact StringTable package/object path makes
+		// build commandlet calls easier for projects that store a single canonical StringTable asset.
+		TArray<FString> ExactStringTablePaths;
+		ExactStringTablePaths.Add(Options.SourceRoot);
+		ExactStringTablePaths.Add(FString::Printf(TEXT("%s.%s"), *Options.SourceRoot,
+			*FPackageName::GetLongPackageAssetName(Options.SourceRoot)));
+
+		for (const FString& ExactStringTablePath : ExactStringTablePaths)
+		{
+			if (UStringTable* ExactStringTable = LoadObject<UStringTable>(nullptr, *ExactStringTablePath))
+			{
+				StringTableAssets.Add(FAssetData(ExactStringTable));
+				break;
+			}
+		}
+
+		if (StringTableAssets.Num() == 0)
+		{
+			UE_LOG(LogGridlyMaterializeContentProfileCommandlet, Warning,
+				TEXT("No StringTable assets found under SourceRoot '%s'. Pass a folder such as /Game/LocStringTables, or an exact StringTable asset path such as /Game/LocStringTables/Test."), *Options.SourceRoot);
+			return false;
+		}
 	}
 
 	for (const FAssetData& AssetData : StringTableAssets)
@@ -347,7 +410,8 @@ bool UGridlyMaterializeContentProfileCommandlet::MaterializeStringTables(const F
 			continue;
 		}
 
-		if (!MaterializeStringTable(SourceStringTable, AssetData.PackageName.ToString(), Options, RowsByNamespaceAndKey, OutStats))
+		if (!MaterializeStringTable(SourceStringTable, AssetData.PackageName.ToString(), Options, RowsByNamespaceAndKey,
+			RowsByKey, OutStats))
 		{
 			return false;
 		}
@@ -358,7 +422,8 @@ bool UGridlyMaterializeContentProfileCommandlet::MaterializeStringTables(const F
 
 bool UGridlyMaterializeContentProfileCommandlet::MaterializeStringTable(UStringTable* SourceStringTable,
 	const FString& SourcePackageName, const FMaterializeOptions& Options,
-	const TMap<FString, FGridlyTableRow>& RowsByNamespaceAndKey, FMaterializeStats& OutStats) const
+	const TMap<FString, FGridlyTableRow>& RowsByNamespaceAndKey, const TMultiMap<FString, FGridlyTableRow>& RowsByKey,
+	FMaterializeStats& OutStats) const
 {
 	const FString OutputPackageName = Options.bApplyToCanonicalForBuild ? SourcePackageName : MakeOutputPackageName(SourcePackageName, Options);
 	if (OutputPackageName.Equals(SourcePackageName, ESearchCase::IgnoreCase))
@@ -415,28 +480,71 @@ bool UGridlyMaterializeContentProfileCommandlet::MaterializeStringTable(UStringT
 	const FString Namespace = SourceStringTable->GetName();
 	FStringTable& OutputTable = OutputStringTable->GetMutableStringTable().Get();
 	const UGridlyGameSettings* GameSettings = GetMutableDefault<UGridlyGameSettings>();
+	const FGridlyContentFilterRule* ActiveRule = FGridlyLocalizedTextConverter::GetActiveContentFilterRule(GameSettings);
 	int32 TableKeys = 0;
 	int32 TableRedactions = 0;
+	int32 TableMatchedRows = 0;
+	int32 TableFlaggedRows = 0;
+	int32 TableAlreadyRedactedRows = 0;
+	int32 TableKeyFallbackMatches = 0;
+	int32 TableAmbiguousKeyFallbacks = 0;
+	TArray<TPair<FString, FString>> RedactedSourceStrings;
 
 	SourceStringTable->GetStringTable().Get().EnumerateSourceStrings(
-		[this, &RowsByNamespaceAndKey, &OutputTable, GameSettings, &Namespace, &TableKeys, &TableRedactions]
+		[this, &RowsByNamespaceAndKey, &RowsByKey, &RedactedSourceStrings, GameSettings, &Namespace, &TableKeys,
+		&TableRedactions, &TableMatchedRows, &TableFlaggedRows, &TableAlreadyRedactedRows, &TableKeyFallbackMatches,
+		&TableAmbiguousKeyFallbacks, ActiveRule]
 		(const FString& Key, const FString& SourceString) -> bool
 		{
 			FString OutputString = SourceString;
-			if (const FGridlyTableRow* GridlyRow = RowsByNamespaceAndKey.Find(MakeRecordLookupKey(Namespace, Key)))
+			FGridlyTableRow KeyFallbackRow;
+			const FGridlyTableRow* GridlyRow = RowsByNamespaceAndKey.Find(MakeRecordLookupKey(Namespace, Key));
+			if (!GridlyRow)
 			{
+				TArray<FGridlyTableRow> KeyCandidates;
+				RowsByKey.MultiFind(Key, KeyCandidates);
+				if (KeyCandidates.Num() == 1)
+				{
+					KeyFallbackRow = KeyCandidates[0];
+					GridlyRow = &KeyFallbackRow;
+					++TableKeyFallbackMatches;
+				}
+				else if (KeyCandidates.Num() > 1)
+				{
+					++TableAmbiguousKeyFallbacks;
+				}
+			}
+
+			if (GridlyRow)
+			{
+				++TableMatchedRows;
+				const bool bShouldRedactRecord = FGridlyLocalizedTextConverter::ShouldRedactRecord(*GridlyRow, GameSettings, ActiveRule);
+				if (bShouldRedactRecord)
+				{
+					++TableFlaggedRows;
+				}
+
 				OutputString = FGridlyLocalizedTextConverter::ApplyContentProfileFilteringToText(SourceString, *GridlyRow,
 					GameSettings, true, false);
 				if (OutputString != SourceString)
 				{
 					++TableRedactions;
 				}
+				else if (bShouldRedactRecord && ActiveRule && SourceString == ActiveRule->ReplacementText)
+				{
+					++TableAlreadyRedactedRows;
+				}
 			}
 
-			OutputTable.SetSourceString(Key, OutputString);
+			RedactedSourceStrings.Emplace(Key, OutputString);
 			++TableKeys;
 			return true;
 		});
+
+	for (const TPair<FString, FString>& RedactedSourceString : RedactedSourceStrings)
+	{
+		OutputTable.SetSourceString(RedactedSourceString.Key, RedactedSourceString.Value);
+	}
 
 	if (!Options.bApplyToCanonicalForBuild)
 	{
@@ -459,13 +567,15 @@ bool UGridlyMaterializeContentProfileCommandlet::MaterializeStringTable(UStringT
 	OutStats.ValuesRedacted += TableRedactions;
 
 	UE_LOG(LogGridlyMaterializeContentProfileCommandlet, Display,
-		TEXT("Materialized '%s' -> '%s' (%d keys, %d redacted)."),
-		*SourcePackageName, *OutputPackageName, TableKeys, TableRedactions);
+		TEXT("Materialized '%s' -> '%s' (%d keys, %d matched Gridly rows, %d flagged rows, %d key fallback matches, %d ambiguous key fallbacks, %d changed to redacted, %d already redacted)."),
+		*SourcePackageName, *OutputPackageName, TableKeys, TableMatchedRows, TableFlaggedRows,
+		TableKeyFallbackMatches, TableAmbiguousKeyFallbacks, TableRedactions, TableAlreadyRedactedRows);
 	return true;
 }
 
 bool UGridlyMaterializeContentProfileCommandlet::MaterializeLocalizationArchives(const FMaterializeOptions& Options,
-	const TMap<FString, FGridlyTableRow>& RowsByNamespaceAndKey, FMaterializeStats& OutStats) const
+	const TMap<FString, FGridlyTableRow>& RowsByNamespaceAndKey, const TMultiMap<FString, FGridlyTableRow>& RowsByKey,
+	FMaterializeStats& OutStats) const
 {
 	const TArray<ULocalizationTarget*> LocalizationTargets = ULocalizationSettings::GetGameTargetSet()->TargetObjects;
 	if (LocalizationTargets.Num() == 0)
@@ -477,7 +587,8 @@ bool UGridlyMaterializeContentProfileCommandlet::MaterializeLocalizationArchives
 
 	for (ULocalizationTarget* LocalizationTarget : LocalizationTargets)
 	{
-		if (LocalizationTarget && !MaterializeArchivesForTarget(LocalizationTarget, Options, RowsByNamespaceAndKey, OutStats))
+		if (LocalizationTarget && !MaterializeArchivesForTarget(LocalizationTarget, Options, RowsByNamespaceAndKey,
+			RowsByKey, OutStats))
 		{
 			return false;
 		}
@@ -488,7 +599,7 @@ bool UGridlyMaterializeContentProfileCommandlet::MaterializeLocalizationArchives
 
 bool UGridlyMaterializeContentProfileCommandlet::MaterializeArchivesForTarget(ULocalizationTarget* LocalizationTarget,
 	const FMaterializeOptions& Options, const TMap<FString, FGridlyTableRow>& RowsByNamespaceAndKey,
-	FMaterializeStats& OutStats) const
+	const TMultiMap<FString, FGridlyTableRow>& RowsByKey, FMaterializeStats& OutStats) const
 {
 	const FString ConfigFilePath = LocalizationConfigurationScript::GetGatherTextConfigPath(LocalizationTarget);
 	const FString SectionName = TEXT("CommonSettings");
@@ -509,6 +620,11 @@ bool UGridlyMaterializeContentProfileCommandlet::MaterializeArchivesForTarget(UL
 	const FString RootPath = bIsEngineTarget ? FPaths::EngineDir() : FPaths::ProjectDir();
 	const FString SourceArchiveRoot = FPaths::ConvertRelativePathToFull(FPaths::Combine(*RootPath, *SourcePath));
 	const UGridlyGameSettings* GameSettings = GetMutableDefault<UGridlyGameSettings>();
+	FString NativeCulture;
+	if (LocalizationTarget->Settings.SupportedCulturesStatistics.IsValidIndex(LocalizationTarget->Settings.NativeCultureIndex))
+	{
+		NativeCulture = LocalizationTarget->Settings.SupportedCulturesStatistics[LocalizationTarget->Settings.NativeCultureIndex].CultureName;
+	}
 
 	for (const FCultureStatistics& CultureStats : LocalizationTarget->Settings.SupportedCulturesStatistics)
 	{
@@ -551,7 +667,9 @@ bool UGridlyMaterializeContentProfileCommandlet::MaterializeArchivesForTarget(UL
 		}
 
 		int32 ArchiveRedactions = 0;
-		RedactArchiveJsonObject(ArchiveJson, TEXT(""), RowsByNamespaceAndKey, GameSettings, ArchiveRedactions);
+		const bool bIsSourceCulture = CultureStats.CultureName.Equals(NativeCulture, ESearchCase::IgnoreCase);
+		RedactArchiveJsonObject(ArchiveJson, TEXT(""), RowsByNamespaceAndKey, GameSettings, RowsByKey,
+			bIsSourceCulture, ArchiveRedactions);
 
 		FString OutputJsonString;
 		const TSharedRef<TJsonWriter<>> JsonWriter = TJsonWriterFactory<>::Create(&OutputJsonString);
@@ -582,7 +700,8 @@ bool UGridlyMaterializeContentProfileCommandlet::MaterializeArchivesForTarget(UL
 
 bool UGridlyMaterializeContentProfileCommandlet::RedactArchiveJsonObject(const TSharedPtr<FJsonObject>& JsonObject,
 	const FString& CurrentNamespace, const TMap<FString, FGridlyTableRow>& RowsByNamespaceAndKey,
-	const UGridlyGameSettings* GameSettings, int32& OutRedactedCount) const
+	const UGridlyGameSettings* GameSettings, const TMultiMap<FString, FGridlyTableRow>& RowsByKey, bool bIsSourceCulture,
+	int32& OutRedactedCount) const
 {
 	if (!JsonObject.IsValid())
 	{
@@ -599,7 +718,20 @@ bool UGridlyMaterializeContentProfileCommandlet::RedactArchiveJsonObject(const T
 	FString Key;
 	if (JsonObject->TryGetStringField(TEXT("Key"), Key))
 	{
-		if (const FGridlyTableRow* GridlyRow = RowsByNamespaceAndKey.Find(MakeRecordLookupKey(EntryNamespace, Key)))
+		FGridlyTableRow KeyFallbackRow;
+		const FGridlyTableRow* GridlyRow = RowsByNamespaceAndKey.Find(MakeRecordLookupKey(EntryNamespace, Key));
+		if (!GridlyRow)
+		{
+			TArray<FGridlyTableRow> KeyCandidates;
+			RowsByKey.MultiFind(Key, KeyCandidates);
+			if (KeyCandidates.Num() == 1)
+			{
+				KeyFallbackRow = KeyCandidates[0];
+				GridlyRow = &KeyFallbackRow;
+			}
+		}
+
+		if (GridlyRow)
 		{
 			const TSharedPtr<FJsonValue> TranslationValue = JsonObject->TryGetField(TEXT("Translation"));
 			const TSharedPtr<FJsonObject> TranslationObject = TranslationValue.IsValid() && TranslationValue->Type == EJson::Object
@@ -610,7 +742,7 @@ bool UGridlyMaterializeContentProfileCommandlet::RedactArchiveJsonObject(const T
 				FString TranslationText;
 				TranslationObject->TryGetStringField(TEXT("Text"), TranslationText);
 				const FString RedactedText = FGridlyLocalizedTextConverter::ApplyContentProfileFilteringToText(TranslationText,
-					*GridlyRow, GameSettings, false, false);
+					*GridlyRow, GameSettings, bIsSourceCulture, false);
 				if (RedactedText != TranslationText)
 				{
 					TranslationObject->SetStringField(TEXT("Text"), RedactedText);
@@ -626,11 +758,135 @@ bool UGridlyMaterializeContentProfileCommandlet::RedactArchiveJsonObject(const T
 		for (const TSharedPtr<FJsonValue>& ChildValue : *Children)
 		{
 			RedactArchiveJsonObject(ChildValue->AsObject(), EntryNamespace, RowsByNamespaceAndKey, GameSettings,
-				OutRedactedCount);
+				RowsByKey, bIsSourceCulture, OutRedactedCount);
 		}
 	}
 
 	return true;
+}
+
+bool UGridlyMaterializeContentProfileCommandlet::RunGatherTextForLocalizationTargets() const
+{
+	TArray<LocalizationCommandletExecution::FTask> Tasks;
+	for (ULocalizationTarget* LocalizationTarget : ULocalizationSettings::GetGameTargetSet()->TargetObjects)
+	{
+		if (!LocalizationTarget)
+		{
+			continue;
+		}
+
+		FString GatherScriptPath = LocalizationConfigurationScript::GetGatherTextConfigPath(LocalizationTarget);
+		GatherScriptPath = FConfigCacheIni::NormalizeConfigIniPath(GatherScriptPath);
+		LocalizationConfigurationScript::GenerateGatherTextConfigFile(LocalizationTarget).WriteWithSCC(GatherScriptPath);
+
+		const bool bUseProjectFile = !LocalizationTarget->IsMemberOfEngineTargetSet();
+		Tasks.Add(LocalizationCommandletExecution::FTask(
+			FText::Format(NSLOCTEXT("GridlyMaterializeContentProfileCommandlet", "GatherTaskNameFormat", "Gather Text ({0})"),
+				FText::FromString(LocalizationTarget->Settings.Name)),
+			GatherScriptPath,
+			bUseProjectFile));
+	}
+
+	if (Tasks.Num() == 0)
+	{
+		UE_LOG(LogGridlyMaterializeContentProfileCommandlet, Warning,
+			TEXT("No localization targets found for Gather Text; StringTables were redacted but localization archives/resources were not regenerated."));
+		return true;
+	}
+
+	UE_LOG(LogGridlyMaterializeContentProfileCommandlet, Display,
+		TEXT("Running Gather Text for %d localization target(s) after StringTable redaction."), Tasks.Num());
+	return RunLocalizationCommandletTasks(Tasks);
+}
+
+bool UGridlyMaterializeContentProfileCommandlet::RunCompileTextForLocalizationTargets() const
+{
+	TArray<LocalizationCommandletExecution::FTask> Tasks;
+	for (ULocalizationTarget* LocalizationTarget : ULocalizationSettings::GetGameTargetSet()->TargetObjects)
+	{
+		if (!LocalizationTarget)
+		{
+			continue;
+		}
+
+		FString CompileScriptPath = LocalizationConfigurationScript::GetCompileTextConfigPath(LocalizationTarget);
+		CompileScriptPath = FConfigCacheIni::NormalizeConfigIniPath(CompileScriptPath);
+		LocalizationConfigurationScript::GenerateCompileTextConfigFile(LocalizationTarget).WriteWithSCC(CompileScriptPath);
+
+		const bool bUseProjectFile = !LocalizationTarget->IsMemberOfEngineTargetSet();
+		Tasks.Add(LocalizationCommandletExecution::FTask(
+			FText::Format(NSLOCTEXT("GridlyMaterializeContentProfileCommandlet", "CompileTaskNameFormat", "Compile Text ({0})"),
+				FText::FromString(LocalizationTarget->Settings.Name)),
+			CompileScriptPath,
+			bUseProjectFile));
+	}
+
+	if (Tasks.Num() == 0)
+	{
+		UE_LOG(LogGridlyMaterializeContentProfileCommandlet, Warning,
+			TEXT("No localization targets found for Compile Text; localization resources were not regenerated."));
+		return true;
+	}
+
+	UE_LOG(LogGridlyMaterializeContentProfileCommandlet, Display,
+		TEXT("Running Compile Text for %d localization target(s) after archive redaction."), Tasks.Num());
+	return RunLocalizationCommandletTasks(Tasks);
+}
+
+namespace
+{
+bool RunLocalizationCommandletTasks(const TArray<LocalizationCommandletExecution::FTask>& Tasks)
+{
+	for (const LocalizationCommandletExecution::FTask& LocTask : Tasks)
+	{
+		TSharedPtr<FLocalizationCommandletProcess> CommandletProcess =
+			FLocalizationCommandletProcess::Execute(LocTask.ScriptPath, LocTask.ShouldUseProjectFile);
+		if (!CommandletProcess.IsValid())
+		{
+			UE_LOG(LogGridlyMaterializeContentProfileCommandlet, Error,
+				TEXT("Failed to start localization commandlet task '%s'."), *LocTask.Name.ToString());
+			return false;
+		}
+
+		UE_LOG(LogGridlyMaterializeContentProfileCommandlet, Display,
+			TEXT("=== Starting localization task [%s] ==="), *LocTask.Name.ToString());
+
+		FProcHandle CurrentProcessHandle = CommandletProcess->GetHandle();
+		int32 ReturnCode = INDEX_NONE;
+
+		for (;;)
+		{
+			const FString PipeString = FPlatformProcess::ReadPipe(CommandletProcess->GetReadPipe());
+			if (!PipeString.IsEmpty())
+			{
+				UE_LOG(LogGridlyMaterializeContentProfileCommandlet, Log, TEXT("%s"), *PipeString);
+			}
+
+			if (!FPlatformProcess::IsProcRunning(CurrentProcessHandle) && PipeString.IsEmpty())
+			{
+				break;
+			}
+
+			FPlatformProcess::Sleep(0.0f);
+		}
+
+		if (!CurrentProcessHandle.IsValid() || !FPlatformProcess::GetProcReturnCode(CurrentProcessHandle, &ReturnCode))
+		{
+			UE_LOG(LogGridlyMaterializeContentProfileCommandlet, Error,
+				TEXT("Localization task '%s' completed but no return code was available."), *LocTask.Name.ToString());
+			return false;
+		}
+
+		UE_LOG(LogGridlyMaterializeContentProfileCommandlet, Display,
+			TEXT("===> Localization task [%s] returned: %d"), *LocTask.Name.ToString(), ReturnCode);
+		if (ReturnCode != 0)
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
 }
 
 bool UGridlyMaterializeContentProfileCommandlet::BackupFileForBuildOverlay(const FString& SourceFilePath,
@@ -652,10 +908,12 @@ bool UGridlyMaterializeContentProfileCommandlet::BackupFileForBuildOverlay(const
 	const FString BackupPath = FPaths::Combine(*FPaths::ProjectSavedDir(), TEXT("GridlyContentProfileBackups"),
 		*Options.LocalizationProfile, *RelativePath);
 	IFileManager::Get().MakeDirectory(*FPaths::GetPath(BackupPath), true);
-	if (!IFileManager::Get().Copy(*BackupPath, *FullSourceFilePath, true, true))
+	const uint32 CopyResult = IFileManager::Get().Copy(*BackupPath, *FullSourceFilePath, true, true);
+	if (CopyResult != COPY_OK)
 	{
 		UE_LOG(LogGridlyMaterializeContentProfileCommandlet, Error,
-			TEXT("Failed to backup '%s' to '%s' before applying build overlay."), *FullSourceFilePath, *BackupPath);
+			TEXT("Failed to backup '%s' to '%s' before applying build overlay. CopyResult=%d"),
+			*FullSourceFilePath, *BackupPath, CopyResult);
 		return false;
 	}
 

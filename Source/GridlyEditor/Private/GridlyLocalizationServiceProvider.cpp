@@ -1895,6 +1895,8 @@ bool FGridlyLocalizationServiceProvider::ImportKeyValuePairsToStringTable(ULocal
 	int32 UpdatedCount = 0;
 	int32 CreatedCount = 0;
 	int32 SkippedCount = 0;
+	int32 UnredactedCount = 0;
+	const UGridlyGameSettings* GameSettings = GetMutableDefault<UGridlyGameSettings>();
 
 	for (const auto& KeyValuePair : KeyValuePairs)
 	{
@@ -1918,6 +1920,19 @@ bool FGridlyLocalizationServiceProvider::ImportKeyValuePairsToStringTable(ULocal
 
 			// Update existing entry
 			MutableStringTable.SetSourceString(Key, Value);
+			if (GameSettings && !GameSettings->bApplyContentProfileFilteringDuringImport)
+			{
+				for (const TPair<FString, FGridlyContentFilterRule>& ProfileRulePair : GameSettings->ProfileRules)
+				{
+					if (!ProfileRulePair.Value.ReplacementText.IsEmpty() &&
+						ExistingValue.Equals(ProfileRulePair.Value.ReplacementText, ESearchCase::CaseSensitive) &&
+						!Value.Equals(ProfileRulePair.Value.ReplacementText, ESearchCase::CaseSensitive))
+					{
+						++UnredactedCount;
+						break;
+					}
+				}
+			}
 			UpdatedCount++;
 			UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("📝 Updated existing entry: %s = %s (was: %s)"), *Key, *Value, *ExistingValue);
 		}
@@ -1930,6 +1945,12 @@ bool FGridlyLocalizationServiceProvider::ImportKeyValuePairsToStringTable(ULocal
 		}
 
 		ImportedCount++;
+	}
+
+	if (UnredactedCount > 0)
+	{
+		UE_LOG(LogGridlyLocalizationServiceProvider, Log,
+			TEXT("Restored %d previously redacted source strings in namespace '%s'."), UnredactedCount, *Namespace);
 	}
 
 	if (OutStats)
@@ -1970,10 +1991,29 @@ bool FGridlyLocalizationServiceProvider::ImportKeyValuePairsToStringTable(ULocal
 UStringTable* FGridlyLocalizationServiceProvider::FindOrCreateStringTable(const FString& Namespace, bool& bOutStringTableCreated)
 {
 	bOutStringTableCreated = false;
+	const UGridlyGameSettings* GameSettings = GetMutableDefault<UGridlyGameSettings>();
+	FString PackagePath = GameSettings ? GameSettings->StringTableSavePath : TEXT("");
+	if (PackagePath.IsEmpty())
+	{
+		PackagePath = TEXT("/Game/Localization/StringTables");
+		UE_LOG(LogGridlyLocalizationServiceProvider, Warning, TEXT("StringTableSavePath is empty, using default path: %s"), *PackagePath);
+	}
+	PackagePath.RemoveFromEnd(TEXT("/"));
+
+	const FString ExpectedPackageName = FString::Printf(TEXT("%s/%s"), *PackagePath, *Namespace);
+	if (UStringTable* ExpectedStringTable = LoadObject<UStringTable>(nullptr,
+		*FString::Printf(TEXT("%s.%s"), *ExpectedPackageName, *Namespace)))
+	{
+		UE_LOG(LogGridlyLocalizationServiceProvider, Display,
+			TEXT("Found canonical string table for namespace '%s': %s"), *Namespace, *ExpectedStringTable->GetPathName());
+		return ExpectedStringTable;
+	}
+
 	// Try to find existing string table
 	FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
 	
 	FARFilter Filter;
+	Filter.PackagePaths.Add(*PackagePath);
 	Filter.ClassPaths.Add(UStringTable::StaticClass()->GetClassPathName());
 	Filter.bRecursivePaths = true;
 	
@@ -2017,17 +2057,6 @@ UStringTable* FGridlyLocalizationServiceProvider::FindOrCreateStringTable(const 
 	
 	// Create a new string table asset for this namespace
 	UE_LOG(LogGridlyLocalizationServiceProvider, Log, TEXT("📋 Creating new string table for namespace: %s"), *Namespace);
-	
-	// Get the save path from plugin settings
-	const UGridlyGameSettings* GameSettings = GetMutableDefault<UGridlyGameSettings>();
-	FString PackagePath = GameSettings->StringTableSavePath;
-	
-	// Fallback to default path if setting is empty
-	if (PackagePath.IsEmpty())
-	{
-		PackagePath = TEXT("/Game/Localization/StringTables");
-		UE_LOG(LogGridlyLocalizationServiceProvider, Warning, TEXT("⚠️ StringTableSavePath is empty, using default path: %s"), *PackagePath);
-	}
 	
 	// Special handling for new_table_56 to use the correct path
 	if (Namespace == TEXT("new_table_56"))

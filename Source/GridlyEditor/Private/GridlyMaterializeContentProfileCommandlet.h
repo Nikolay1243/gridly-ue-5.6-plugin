@@ -44,18 +44,23 @@ private:
 	bool ParseOptions(const FString& Params, FMaterializeOptions& OutOptions) const;
 	bool ValidateOptions(const FMaterializeOptions& Options) const;
 	bool FetchGridlyRows(TArray<FGridlyTableRow>& OutRows) const;
-	void BuildRecordLookup(const TArray<FGridlyTableRow>& Rows, TMap<FString, FGridlyTableRow>& OutRowsByNamespaceAndKey) const;
+	void BuildRecordLookup(const TArray<FGridlyTableRow>& Rows, TMap<FString, FGridlyTableRow>& OutRowsByNamespaceAndKey,
+		TMultiMap<FString, FGridlyTableRow>& OutRowsByKey) const;
 	bool MaterializeStringTables(const FMaterializeOptions& Options, const TMap<FString, FGridlyTableRow>& RowsByNamespaceAndKey,
-		FMaterializeStats& OutStats) const;
+		const TMultiMap<FString, FGridlyTableRow>& RowsByKey, FMaterializeStats& OutStats) const;
 	bool MaterializeStringTable(UStringTable* SourceStringTable, const FString& SourcePackageName, const FMaterializeOptions& Options,
-		const TMap<FString, FGridlyTableRow>& RowsByNamespaceAndKey, FMaterializeStats& OutStats) const;
-	bool MaterializeLocalizationArchives(const FMaterializeOptions& Options, const TMap<FString, FGridlyTableRow>& RowsByNamespaceAndKey,
+		const TMap<FString, FGridlyTableRow>& RowsByNamespaceAndKey, const TMultiMap<FString, FGridlyTableRow>& RowsByKey,
 		FMaterializeStats& OutStats) const;
+	bool MaterializeLocalizationArchives(const FMaterializeOptions& Options, const TMap<FString, FGridlyTableRow>& RowsByNamespaceAndKey,
+		const TMultiMap<FString, FGridlyTableRow>& RowsByKey, FMaterializeStats& OutStats) const;
 	bool MaterializeArchivesForTarget(ULocalizationTarget* LocalizationTarget, const FMaterializeOptions& Options,
-		const TMap<FString, FGridlyTableRow>& RowsByNamespaceAndKey, FMaterializeStats& OutStats) const;
+		const TMap<FString, FGridlyTableRow>& RowsByNamespaceAndKey, const TMultiMap<FString, FGridlyTableRow>& RowsByKey,
+		FMaterializeStats& OutStats) const;
 	bool RedactArchiveJsonObject(const TSharedPtr<FJsonObject>& JsonObject, const FString& CurrentNamespace,
 		const TMap<FString, FGridlyTableRow>& RowsByNamespaceAndKey, const UGridlyGameSettings* GameSettings,
-		int32& OutRedactedCount) const;
+		const TMultiMap<FString, FGridlyTableRow>& RowsByKey, bool bIsSourceCulture, int32& OutRedactedCount) const;
+	bool RunGatherTextForLocalizationTargets() const;
+	bool RunCompileTextForLocalizationTargets() const;
 	bool BackupFileForBuildOverlay(const FString& SourceFilePath, const FMaterializeOptions& Options) const;
 	FString MakeRecordLookupKey(const FString& Namespace, const FString& Key) const;
 	FString MakeOutputPackageName(const FString& SourcePackageName, const FMaterializeOptions& Options) const;
